@@ -1551,17 +1551,7 @@ std::unique_ptr<column> merge_tdigests(tdigest_column_view const& tdv,
       auto p_tdigest_offsets =
         cuda::std::span<size_type const>{_p_tdigest_offsets.data(), _p_tdigest_offsets.size()};
 
-<<<<<<< HEAD
       rmm::device_uvector<size_type> d_p_group_labels(num_group_labels, stream);
-=======
-      rmm::device_uvector<int32_t> p_tdigest_offsets(tdigest_offsets.size(), stream, pinned_mr);
-      thrust::copy(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-                   tdigest_offsets.begin<int32_t>(),
-                   tdigest_offsets.begin<int32_t>() + p_tdigest_offsets.size(),
-                   p_tdigest_offsets.begin());
-
-      rmm::device_uvector<size_type> _p_group_labels(num_group_labels, stream, pinned_mr);
->>>>>>> main
       thrust::copy(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
                    group_labels,
                    group_labels + num_group_labels,
@@ -1581,14 +1571,7 @@ std::unique_ptr<column> merge_tdigests(tdigest_column_view const& tdv,
         centroid_group_info{
           p_cumulative_weights.begin(), p_group_offsets, p_tdigest_offsets.data()},
         cumulative_centroid_weight{
-<<<<<<< HEAD
           p_cumulative_weights.begin(), p_group_labels, p_group_offsets, p_tdigest_offsets},
-=======
-          p_cumulative_weights.begin(),
-          p_group_labels,
-          p_group_offsets,
-          cuda::std::span<int32_t const>{p_tdigest_offsets.begin(), p_tdigest_offsets.size()}},
->>>>>>> main
         has_nulls,
         stream,
         mr);
