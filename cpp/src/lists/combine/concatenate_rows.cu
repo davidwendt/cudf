@@ -70,7 +70,7 @@ generate_regrouped_offsets_and_null_mask(table_device_view const& input,
 {
   // outgoing offsets.
   auto offsets = cudf::make_fixed_width_column(
-    data_type{type_to_id<size_type>()}, input.num_rows() + 1, mask_state::UNALLOCATED, stream, mr);
+    data_type{type_id::INT32}, input.num_rows() + 1, mask_state::UNALLOCATED, stream, mr);
 
   auto keys =
     thrust::make_transform_iterator(cuda::counting_iterator<std::size_t>{0},
@@ -97,7 +97,7 @@ generate_regrouped_offsets_and_null_mask(table_device_view const& input,
         }
       }
       auto offsets =
-        input.column(col_index).child(lists_column_view::offsets_column_index).data<size_type>() +
+        input.column(col_index).child(lists_column_view::offsets_column_index).data<int32_t>() +
         input.column(col_index).offset();
       return offsets[row_index + 1] - offsets[row_index];
     }));
@@ -106,7 +106,7 @@ generate_regrouped_offsets_and_null_mask(table_device_view const& input,
                                     keys + (input.num_rows() * input.num_columns()),
                                     values,
                                     cuda::make_discard_iterator(),
-                                    offsets->mutable_view().begin<size_type>(),
+                                    offsets->mutable_view().begin<int32_t>(),
                                     cuda::std::plus<size_type>(),
                                     stream);
 
