@@ -15,6 +15,8 @@
 #include <rmm/detail/aligned.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cuda/stream_ref>
+
 #include <algorithm>
 #include <atomic>
 #include <cassert>

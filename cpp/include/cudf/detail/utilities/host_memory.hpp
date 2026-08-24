@@ -63,7 +63,7 @@ get_stream_ordered_pinned_memory_resource();
  * @return The allocator to be used for the host memory allocation
  */
 template <typename T>
-rmm_host_allocator<T> get_host_allocator(std::size_t size, rmm::cuda_stream_view stream)
+rmm_host_allocator<T> get_host_allocator(std::size_t size, cuda::stream_ref stream)
 {
   if (size * sizeof(T) <= get_allocate_host_as_pinned_threshold()) {
     return {get_stream_ordered_pinned_memory_resource(), stream};

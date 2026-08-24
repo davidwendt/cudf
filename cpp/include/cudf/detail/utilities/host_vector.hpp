@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cudf/detail/utilities/cuda.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/export.hpp>
@@ -100,7 +101,7 @@ class rmm_host_allocator {
 #pragma nv_exec_check_disable
 #endif
   template <typename ResourceType>
-  rmm_host_allocator(ResourceType _mr, rmm::cuda_stream_view _stream)
+  rmm_host_allocator(ResourceType _mr, cuda::stream_ref _stream)
     : mr(std::move(_mr)),
       stream(std::move(_stream)),
       _is_device_accessible{
@@ -196,7 +197,7 @@ class rmm_host_allocator {
 
  private:
   rmm::host_async_resource_ref mr;
-  rmm::cuda_stream_view stream;
+  cuda::stream_ref stream;
   bool _is_device_accessible;
 };
 
