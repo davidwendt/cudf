@@ -19,6 +19,7 @@
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/strings/case.hpp>
+#include <cudf/strings/detail/char_tables.hpp>
 #include <cudf/strings/detail/strings_children.cuh>
 #include <cudf/strings/detail/strings_column_factories.cuh>
 #include <cudf/strings/detail/utilities.cuh>
@@ -328,12 +329,16 @@ CUDF_KERNEL void special_tokens_kernel(uint32_t* d_normalized,
  * @param do_lower_case True if the normalization includes lower-casing characters
  * @param d_output The output of the normalization (UTF-8 encoded)
  */
-CUDF_KERNEL void data_normalizer_kernel(char const* d_chars,
-                                        int64_t total_bytes,
-                                        codepoint_metadata_type const* cp_metadata,
-                                        aux_codepoint_data_type const* aux_table,
-                                        bool do_lower_case,
-                                        uint32_t* d_output)
+CUDF_KERNEL void data_normalizer_kernel(
+  char const* d_chars,
+  int64_t total_bytes,
+  codepoint_metadata_type const* cp_metadata,
+  aux_codepoint_data_type const* aux_table,
+  bool do_lower_case,
+  bool strip_accents,
+  bool pad_punctuation,
+  cudf::strings::detail::character_flags_table_type const* char_flags,
+  uint32_t* d_output)
 {
   uint32_t replacement[MAX_NEW_CHARS] = {0};
 
@@ -347,11 +352,25 @@ CUDF_KERNEL void data_normalizer_kernel(char const* d_chars,
     }();
     auto const metadata = cp_metadata[cp];
 
-    if (!should_remove_cp(metadata, do_lower_case)) {
+    if (!should_remove_cp(metadata, do_lower_case, strip_accents)) {
       int8_t num_new_chars = 1;
       // retrieve the normalized value for cp
-      auto const new_cp = do_lower_case || always_replace(metadata) ? get_first_cp(metadata) : cp;
-      replacement[0]    = new_cp == 0 ? cp : new_cp;
+      uint32_t new_cp;
+      if (do_lower_case || always_replace(metadata)) {
+        new_cp = get_first_cp(metadata);
+      } else if (strip_accents) {
+        // Use the de-accented ASCII result when available; re-uppercase if needed
+        auto const mapped = get_first_cp(metadata);
+        if (mapped != 0 && mapped <= 0x7Fu) {
+          auto const flag = cp < 0x10000u ? char_flags[cp] : uint8_t{0};
+          new_cp          = cudf::strings::detail::IS_UPPER(flag) ? (mapped - 'a' + 'A') : mapped;
+        } else {
+          new_cp = 0;
+        }
+      } else {
+        new_cp = 0;
+      }
+      replacement[0] = new_cp == 0 ? cp : new_cp;
 
       if (do_lower_case && is_multi_char_transform(metadata)) {
         auto const next_cps = aux_table[cp];
@@ -360,7 +379,7 @@ CUDF_KERNEL void data_normalizer_kernel(char const* d_chars,
         num_new_chars       = 2 + (replacement[2] != 0);
       }
 
-      if (should_add_spaces(metadata, do_lower_case) && (num_new_chars == 1)) {
+      if (should_add_spaces(metadata, do_lower_case, pad_punctuation) && (num_new_chars == 1)) {
         replacement[1] = replacement[0];
         replacement[0] = SPACE_CODE_POINT;  // add spaces around the new codepoint
         replacement[2] = SPACE_CODE_POINT;
@@ -491,6 +510,8 @@ Iterator remove_safe(Iterator first, Iterator last, T const& value, cuda::stream
 
 std::unique_ptr<cudf::column> normalize_characters(cudf::strings_column_view const& input,
                                                    character_normalizer const& normalizer,
+                                                   bool strip_accents,
+                                                   bool pad_punctuation,
                                                    cuda::stream_ref stream,
                                                    rmm::device_async_resource_ref mr)
 {
@@ -509,6 +530,11 @@ std::unique_ptr<cudf::column> normalize_characters(cudf::strings_column_view con
 
   auto const& parameters = normalizer._impl;
 
+  // char_flags only needed when stripping accents without lowercasing (re-uppercase logic)
+  auto const char_flags = (strip_accents && !parameters->do_lower_case)
+                            ? cudf::strings::detail::get_character_flags_table(stream)
+                            : nullptr;
+
   auto d_normalized = rmm::device_uvector<uint32_t>(max_new_char_total, stream);
   data_normalizer_kernel<<<grid.num_blocks, grid.num_threads_per_block, 0, stream.get()>>>(
     d_input_chars,
@@ -516,6 +542,9 @@ std::unique_ptr<cudf::column> normalize_characters(cudf::strings_column_view con
     parameters->cp_metadata.data(),
     parameters->aux_table.data(),
     parameters->do_lower_case,
+    strip_accents,
+    pad_punctuation,
+    char_flags,
     d_normalized.data());
   CUDF_CUDA_TRY(cudaGetLastError());
 
@@ -560,7 +589,19 @@ std::unique_ptr<cudf::column> normalize_characters(cudf::strings_column_view con
                                                    rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::normalize_characters(input, normalizer, stream, mr);
+  return detail::normalize_characters(input, normalizer, false, true, stream, mr);
+}
+
+std::unique_ptr<cudf::column> normalize_characters(cudf::strings_column_view const& input,
+                                                   character_normalizer const& normalizer,
+                                                   normalize_flags flags,
+                                                   cuda::stream_ref stream,
+                                                   rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+  auto const strip    = static_cast<bool>(flags & normalize_flags::STRIP_ACCENTS);
+  auto const tokenize = static_cast<bool>(flags & normalize_flags::PAD_PUNCTUATION);
+  return detail::normalize_characters(input, normalizer, strip, tokenize, stream, mr);
 }
 
 }  // namespace nvtext

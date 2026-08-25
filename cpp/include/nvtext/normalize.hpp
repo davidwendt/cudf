@@ -50,6 +50,45 @@ std::unique_ptr<cudf::column> normalize_spaces(
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
+ * @brief Bitmask flags controlling the behavior of nvtext::normalize_characters.
+ *
+ * Flags may be combined with bitwise OR:
+ * @code{.cpp}
+ * normalize_flags::STRIP_ACCENTS | normalize_flags::PAD_PUNCTUATION
+ * @endcode
+ *
+ * Note: when the `character_normalizer` was created with `do_lower_case = true`,
+ * accent stripping is already implied by the lower-casing transform and
+ * `STRIP_ACCENTS` has no additional effect.
+ */
+enum class normalize_flags : uint32_t {
+  NONE            = 0,
+  STRIP_ACCENTS   = 1 << 0,  ///< Remove diacritics from accented characters
+  PAD_PUNCTUATION = 1 << 1,  ///< Add spaces around punctuation and CJK characters
+};
+
+/**
+ * @brief Bitwise OR of two normalize_flags values
+ * @param a First flags value
+ * @param b Second flags value
+ * @return Combined flags
+ */
+inline normalize_flags operator|(normalize_flags a, normalize_flags b)
+{
+  return static_cast<normalize_flags>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+/**
+ * @brief Bitwise AND of two normalize_flags values
+ * @param a First flags value
+ * @param b Second flags value
+ * @return Intersection of flags
+ */
+inline normalize_flags operator&(normalize_flags a, normalize_flags b)
+{
+  return static_cast<normalize_flags>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+}
+
+/**
  * @brief Normalizer object to be used with nvtext::normalize_characters
  *
  * Use nvtext::create_normalizer to create this object.
@@ -72,6 +111,10 @@ std::unique_ptr<cudf::column> normalize_spaces(
  * and lower-casing cannot be performed without also removing accents.
  * However, if the accented character is already lower-case, then only the
  * accent is removed.
+ *
+ * Note: when `do_lower_case = true`, accent stripping is already implied by
+ * the lower-casing transform. Passing `normalize_flags::STRIP_ACCENTS` to
+ * nvtext::normalize_characters has no additional effect in that case.
  *
  * If `special_tokens` are included the padding after `[` and before `]` is not
  * inserted if the characters between them match one of the given tokens.
@@ -156,6 +199,37 @@ std::unique_ptr<character_normalizer> create_character_normalizer(
 std::unique_ptr<cudf::column> normalize_characters(
   cudf::strings_column_view const& input,
   character_normalizer const& normalizer,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * @brief Normalizes the text in input strings column with explicit behavioral flags.
+ *
+ * @see nvtext::character_normalizer for details on the normalizer behavior.
+ * @see nvtext::normalize_flags for the available flags.
+ *
+ * @code{.pseudo}
+ * cn = create_character_normalizer(false)
+ * s = ["Héllo", "ÑOÑO", "á"]   // a + combining acute
+ * flags = normalize_flags::STRIP_ACCENTS | normalize_flags::PAD_PUNCTUATION
+ * s1 = normalize_characters(s, cn, flags)
+ * s1 is now ["Hello", "NONO", "a"]
+ * @endcode
+ *
+ * A null input element at row `i` produces a corresponding null entry
+ * for row `i` in the output column.
+ *
+ * @param input The input strings to normalize
+ * @param normalizer Normalizer to use for this function
+ * @param flags Bitmask of nvtext::normalize_flags values
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Memory resource to allocate any returned objects
+ * @return Normalized strings column
+ */
+std::unique_ptr<cudf::column> normalize_characters(
+  cudf::strings_column_view const& input,
+  character_normalizer const& normalizer,
+  normalize_flags flags,
   cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
