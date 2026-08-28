@@ -313,6 +313,11 @@ CUDF_KERNEL void special_tokens_kernel(uint32_t* d_normalized,
   }
 }
 
+// Highest codepoint that maps to a plain ASCII result via get_first_cp
+constexpr uint32_t ASCII_MAX_CODEPOINT = 0x7Fu;
+// The char_flags table covers exactly the Basic Multilingual Plane
+constexpr uint32_t BMP_CODEPOINT_LIMIT = 0x10000u;
+
 /**
  * @brief The normalizer kernel
  *
@@ -361,8 +366,8 @@ CUDF_KERNEL void data_normalizer_kernel(
       } else if (strip_accents) {
         // Use the de-accented ASCII result when available; re-uppercase if needed
         auto const mapped = get_first_cp(metadata);
-        if (mapped != 0 && mapped <= 0x7Fu) {
-          auto const flag = cp < 0x10000u ? char_flags[cp] : uint8_t{0};
+        if (mapped != 0 && mapped <= ASCII_MAX_CODEPOINT) {
+          auto const flag = cp < BMP_CODEPOINT_LIMIT ? char_flags[cp] : uint8_t{0};
           new_cp          = cudf::strings::detail::IS_UPPER(flag) ? (mapped - 'a' + 'A') : mapped;
         } else {
           new_cp = 0;
