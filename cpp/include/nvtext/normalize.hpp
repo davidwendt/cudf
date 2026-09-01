@@ -57,7 +57,7 @@ std::unique_ptr<cudf::column> normalize_spaces(
  * normalize_flags::STRIP_ACCENTS | normalize_flags::PAD_PUNCTUATION
  * @endcode
  *
- * Note: If the `character_normalizer` object is created with `do_lower_case = true`,
+ * If the `character_normalizer` object is created with `do_lower_case = true`,
  * accent stripping is already implied by the lower-casing transform and
  * `STRIP_ACCENTS` has no additional effect.
  */
@@ -69,6 +69,7 @@ enum class normalize_flags : uint32_t {
 
 /**
  * @brief Combine two normalize_flags values
+ *
  * @param a First flags value
  * @param b Second flags value
  * @return Combined flags
@@ -80,6 +81,7 @@ inline normalize_flags operator|(normalize_flags a, normalize_flags b)
 
 /**
  * @brief Used for checking if one or more flags are set
+ *
  * @param a First flags value
  * @param b Second flags value
  * @return Masked combination of flags
@@ -113,7 +115,7 @@ inline normalize_flags operator&(normalize_flags a, normalize_flags b)
  * However, if the accented character is already lower-case, then only the
  * accent is removed.
  *
- * Also with `do_lower_case = true`, accent stripping is already implied by
+ * Also if `do_lower_case = true`, accent stripping is already implied by
  * the lower-casing transform. Passing `normalize_flags::STRIP_ACCENTS` to
  * nvtext::normalize_characters has no additional effect in that case.
  *
@@ -222,7 +224,7 @@ std::unique_ptr<cudf::column> normalize_characters(
  *
  * If the `normalizer` object was created with `do_lower_case = true`, accent stripping is already
  * implied by the lower-casing transform. Passing `normalize_flags::STRIP_ACCENTS` here no
- * additional effect.
+ * additional effect. To lower-case without removing accents use the cudf::strings::to_lower API.
  *
  * @param input The input strings to normalize
  * @param normalizer Normalizer to use for this function

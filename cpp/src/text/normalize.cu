@@ -360,21 +360,15 @@ CUDF_KERNEL void data_normalizer_kernel(
     if (!should_remove_cp(metadata, do_lower_case, strip_accents)) {
       int8_t num_new_chars = 1;
       // retrieve the normalized value for cp
-      uint32_t new_cp;
-      if (do_lower_case || always_replace(metadata)) {
-        new_cp = get_first_cp(metadata);
-      } else if (strip_accents) {
+      uint32_t new_cp = [char_flags, do_lower_case, strip_accents, metadata, cp] {
+        if (do_lower_case || always_replace(metadata)) { return get_first_cp(metadata); }
+        if (!strip_accents) { return 0u; }
         // Use the de-accented ASCII result when available; re-uppercase if needed
         auto const mapped = get_first_cp(metadata);
-        if (mapped != 0 && mapped <= ASCII_MAX_CODEPOINT) {
-          auto const flag = cp < BMP_CODEPOINT_LIMIT ? char_flags[cp] : uint8_t{0};
-          new_cp          = cudf::strings::detail::IS_UPPER(flag) ? (mapped - 'a' + 'A') : mapped;
-        } else {
-          new_cp = 0;
-        }
-      } else {
-        new_cp = 0;
-      }
+        if (mapped == 0 || mapped > ASCII_MAX_CODEPOINT) { return 0u; }
+        auto const flag = cp < BMP_CODEPOINT_LIMIT ? char_flags[cp] : uint8_t{0};
+        return cudf::strings::detail::IS_UPPER(flag) ? (mapped - 'a' + 'A') : mapped;
+      }();
       replacement[0] = new_cp == 0 ? cp : new_cp;
 
       if (do_lower_case && is_multi_char_transform(metadata)) {
