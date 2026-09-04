@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import functools
 import unicodedata as ud
 
 import numpy as np
@@ -15,10 +16,26 @@ from cudf.core.column.column import ColumnBase
 from cudf.core.dataframe import DataFrame
 from cudf.core.series import Series
 
-# Raw Unicode data cached after the first scan so that repeated calls to
-# from_python_unicodedata() skip the 1.1M-codepoint Python loop.
-# Keyed by ud.unidata_version so it auto-invalidates if Python is upgraded.
-_UNICODE_RAW_CACHE: dict[str, tuple[list[str], np.ndarray, list[str]]] = {}
+
+@functools.lru_cache(maxsize=None)
+def _load_unicode_raw_data(
+    unidata_version: str,
+) -> tuple[list[str], np.ndarray, list[str]]:
+    # Scans all non-ASCII codepoints and collects entries with a non-zero CCC
+    # or a decomposition mapping.  lru_cache's internal RLock ensures this
+    # runs only once even under concurrent callers.
+    cp_list: list[str] = []
+    ccc_list: list[int] = []
+    decomp_list: list[str] = []
+    for cp in range(0x0080, 0x110000):
+        c = chr(cp)
+        ccc = ud.combining(c)
+        decomp = ud.decomposition(c)
+        if ccc != 0 or decomp:
+            cp_list.append(f"{cp:04X}")
+            ccc_list.append(ccc)
+            decomp_list.append(decomp)
+    return cp_list, np.array(ccc_list, dtype="int32"), decomp_list
 
 
 class UnicodeNormalizer:
@@ -138,26 +155,9 @@ class UnicodeNormalizer:
                 f"Expected one of: {list(cls._FORM_MAP)}"
             )
 
-        cache_key = ud.unidata_version
-        if cache_key not in _UNICODE_RAW_CACHE:
-            cp_list: list[str] = []
-            ccc_list: list[int] = []
-            decomp_list: list[str] = []
-            for cp in range(0x0080, 0x110000):
-                c = chr(cp)
-                ccc = ud.combining(c)
-                decomp = ud.decomposition(c)
-                if ccc != 0 or decomp:
-                    cp_list.append(f"{cp:04X}")
-                    ccc_list.append(ccc)
-                    decomp_list.append(decomp)
-            _UNICODE_RAW_CACHE[cache_key] = (
-                cp_list,
-                np.array(ccc_list, dtype="int32"),
-                decomp_list,
-            )
-
-        cp_list, ccc_arr, decomp_list = _UNICODE_RAW_CACHE[cache_key]
+        cp_list, ccc_arr, decomp_list = _load_unicode_raw_data(
+            ud.unidata_version
+        )
         unicode_data = DataFrame(
             {
                 "cp": Series(cp_list),
