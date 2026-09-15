@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -14,41 +14,37 @@ namespace cudf::strings::detail {
 /**
  * @copydoc cudf::strings::split
  */
-std::unique_ptr<table> split(
-  strings_column_view const& strings_column,
-  string_scalar const& delimiter    = string_scalar(""),
-  size_type maxsplit                = -1,
-  cuda::stream_ref stream           = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+std::unique_ptr<table> split(strings_column_view const& strings_column,
+                             string_scalar const& delimiter,
+                             size_type maxsplit,
+                             cuda::stream_ref stream,
+                             rmm::device_async_resource_ref mr);
 
 /**
  * @copydoc cudf::strings::rsplit
  */
-std::unique_ptr<table> rsplit(
-  strings_column_view const& strings_column,
-  string_scalar const& delimiter    = string_scalar(""),
-  size_type maxsplit                = -1,
-  cuda::stream_ref stream           = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+std::unique_ptr<table> rsplit(strings_column_view const& strings_column,
+                              string_scalar const& delimiter,
+                              size_type maxsplit,
+                              cuda::stream_ref stream,
+                              rmm::device_async_resource_ref mr);
 
 /**
- * @copydoc cudf::strings::detail::split_record
+ * @copydoc cudf::strings::split_record
  */
-std::unique_ptr<column> split_record(
-  strings_column_view const& strings,
-  string_scalar const& delimiter    = string_scalar(""),
-  size_type maxsplit                = -1,
-  cuda::stream_ref stream           = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+std::unique_ptr<column> split_record(strings_column_view const& strings,
+                                     string_scalar const& delimiter,
+                                     size_type maxsplit,
+                                     cuda::stream_ref stream,
+                                     rmm::device_async_resource_ref mr);
 
 /**
- * @copydoc cudf::strings::detail::rsplit_record
+ * @copydoc cudf::strings::rsplit_record
  */
-std::unique_ptr<column> rsplit_record(
-  strings_column_view const& strings,
-  string_scalar const& delimiter    = string_scalar(""),
-  size_type maxsplit                = -1,
-  cuda::stream_ref stream           = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+std::unique_ptr<column> rsplit_record(strings_column_view const& strings,
+                                      string_scalar const& delimiter,
+                                      size_type maxsplit,
+                                      cuda::stream_ref stream,
+                                      rmm::device_async_resource_ref mr);
 
 }  // namespace cudf::strings::detail
