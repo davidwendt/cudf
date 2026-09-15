@@ -12,8 +12,8 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/detail/iterator.cuh>
 #include <cudf/detail/nvtx/ranges.hpp>
+#include <cudf/strings/detail/split.hpp>
 #include <cudf/strings/detail/strings_column_factories.cuh>
-#include <cudf/strings/split/split.hpp>
 #include <cudf/strings/split/split_re.hpp>
 #include <cudf/strings/string_view.cuh>
 #include <cudf/utilities/default_stream.hpp>
@@ -213,8 +213,8 @@ std::unique_ptr<table> split_re(strings_column_view const& input,
   if (fp == literal_fast_path::LITERAL_ONLY) {
     auto const delim = string_scalar(literal, true, stream);
     return direction == split_direction::FORWARD
-             ? cudf::strings::split(input, delim, maxsplit, stream, mr)
-             : cudf::strings::rsplit(input, delim, maxsplit, stream, mr);
+             ? cudf::strings::detail::split(input, delim, maxsplit, stream, mr)
+             : cudf::strings::detail::rsplit(input, delim, maxsplit, stream, mr);
   }
 
   auto const strings_count = input.size();
@@ -286,8 +286,8 @@ std::unique_ptr<column> split_record_re(strings_column_view const& input,
   if (fp == literal_fast_path::LITERAL_ONLY) {
     auto const delim = string_scalar(literal, true, stream);
     return direction == split_direction::FORWARD
-             ? cudf::strings::split_record(input, delim, maxsplit, stream, mr)
-             : cudf::strings::rsplit_record(input, delim, maxsplit, stream, mr);
+             ? cudf::strings::detail::split_record(input, delim, maxsplit, stream, mr)
+             : cudf::strings::detail::rsplit_record(input, delim, maxsplit, stream, mr);
   }
 
   auto const strings_count = input.size();
