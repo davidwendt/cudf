@@ -33,8 +33,8 @@ cpdef Column slice_strings(
     """Perform a slice operation on a strings column.
 
     ``start`` and ``stop`` may be a
-    :py:class:`~pylibcudf.column.Column` or an ``int``. But ``step``
-    must be an ``int``.
+    :py:class:`~pylibcudf.column.Column`, an ``int``, or ``None``.
+    But ``step`` must be an ``int`` or ``None``.
 
     For details, see :cpp:func:`slice_strings`.
 
@@ -42,12 +42,15 @@ cpdef Column slice_strings(
     ----------
     input : Column
         Strings column for this operation
-    start : Union[Column, int]
+    start : Union[Column, int, None]
         The start character position or positions.
-    stop : Union[Column, int]
-        The end character position or positions
-    step : int
-        Distance between input characters retrieved
+        ``None`` uses the beginning of each string.
+    stop : Union[Column, int, None]
+        The end character position or positions.
+        ``None`` uses the end of each string.
+    step : int, optional
+        Distance between input characters retrieved.
+        ``None`` uses a step of 1.
     stream : Stream | None
         CUDA stream on which to perform the operation.
 
