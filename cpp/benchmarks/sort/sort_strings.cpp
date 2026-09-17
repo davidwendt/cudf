@@ -24,9 +24,7 @@ static void bench_sort_strings(nvbench::state& state)
     cudf::type_id::STRING, distribution_id::NORMAL, min_width, max_width);
 
   auto const table = create_random_table({cudf::type_id::STRING}, row_count{num_rows}, profile);
-
-  auto sv    = cudf::strings_column_view(table->view().column(0));
-  auto bytes = table->alloc_size();
+  auto const bytes = table->alloc_size();
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().get()));
   state.add_global_memory_reads<nvbench::int8_t>(bytes);
@@ -59,9 +57,7 @@ static void bench_sorted_order_strings(nvbench::state& state)
       .no_validity();
 
   auto const table = create_random_table({cudf::type_id::STRING}, row_count{num_rows}, profile);
-
-  auto sv    = cudf::strings_column_view(table->view().column(0));
-  auto bytes = table->alloc_size();
+  auto const bytes = table->alloc_size();
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().get()));
   state.add_global_memory_reads<nvbench::int8_t>(bytes);
