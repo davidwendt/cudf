@@ -847,12 +847,12 @@ class strings_column_wrapper : public detail::column_wrapper {
     auto [chars, offsets] = detail::make_chars_and_offsets(begin, end, all_valid);
     auto d_chars   = cudf::detail::make_device_uvector_async(chars, stream, mr.get_output_mr());
     auto d_offsets = std::make_unique<cudf::column>(
-      cudf::detail::make_device_uvector(offsets, stream, mr.get_output_mr()),
+      cudf::detail::make_device_uvector_async(offsets, stream, mr.get_output_mr()),
       rmm::device_buffer{},
       0);
     wrapped =
       cudf::make_strings_column(num_strings, std::move(d_offsets), d_chars.release(), 0, {});
-    stream.sync();
+    stream.sync();  // chars and offsets go out of scope
   }
 
   /**

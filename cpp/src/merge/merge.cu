@@ -263,8 +263,7 @@ index_vector generate_merged_indices(table_view const& left_table,
                   right_begin + right_size,
                   merged_indices.begin(),
                   ineq_op);
-    stream.sync();
-
+    stream.sync();  // new_null_precedence goes out of scope
   } else {
     auto ineq_op = detail::row_lexicographic_tagged_comparator<false>(
       *lhs_device_view, *rhs_device_view, d_column_order, {});
