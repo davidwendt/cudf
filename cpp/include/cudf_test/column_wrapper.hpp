@@ -916,6 +916,7 @@ class strings_column_wrapper : public detail::column_wrapper {
     auto [d_bitmask, null_count] = detail::make_null_mask(v, v + num_strings, stream, mr);
     wrapped                      = cudf::make_strings_column(
       num_strings, std::move(d_offsets), d_chars.release(), null_count, std::move(d_bitmask));
+    stream.sync();  // chars and offsets go out of scope
   }
 
   /**
