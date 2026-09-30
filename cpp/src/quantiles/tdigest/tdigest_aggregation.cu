@@ -1563,9 +1563,9 @@ std::unique_ptr<column> merge_tdigests(tdigest_column_view const& tdv,
       cudf::device_span<size_type const> p_group_labels(_p_group_labels.data(),
                                                         _p_group_labels.size());
 
-      cudf::detail::sync_stream(stream);
       auto pinned_mr = cudf::get_pinned_memory_resource();
       rmm::device_uvector<double> p_cumulative_weights(cumulative_weights, stream, pinned_mr);
+      cudf::detail::sync_stream(stream);
       return generate_group_cluster_info(
         delta,
         num_groups,
