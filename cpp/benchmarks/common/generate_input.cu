@@ -452,11 +452,17 @@ struct string_generator {
   char* chars;
   cuda::std::philox4x32 engine;
   cuda::std::uniform_int_distribution<unsigned char> char_dist;
-  string_generator(char* c, cuda::std::philox4x32& engine)
-    : chars(c), engine(engine), char_dist(32, Encoding == string_encoding::ASCII ? 126 : 137)
-  // ~90% ASCII, ~10% UTF-8.
-  // ~80% not-space, ~20% space.
-  // range 32-127 is ASCII; 127-136 will be multi-byte UTF-8
+  unsigned char last_char;  // replaces a multi-byte character that would not fit at the end
+  // With the default range of 32-137: ~90% ASCII, ~10% UTF-8.
+  // Characters 32-126 are ASCII; 127 and above will be multi-byte UTF-8
+  string_generator(char* c,
+                   cuda::std::philox4x32& engine,
+                   unsigned char char_lower,
+                   unsigned char char_upper)
+    : chars(c),
+      engine(engine),
+      char_dist(char_lower, char_upper),
+      last_char(char_lower < '\x7F' ? char_lower : ' ')
   {
   }
   __device__ void operator()(cuda::std::tuple<int64_t, int64_t> str_begin_end)
@@ -467,9 +473,9 @@ struct string_generator {
     for (auto i = begin; i < end; ++i) {
       auto ch = char_dist(engine);
       if constexpr (Encoding == string_encoding::UTF8) {
-        if (i == end - 1 && ch >= '\x7F') ch = ' ';  // last element ASCII only.
-        if (ch >= '\x7F') {                          // x7F is at the top edge of ASCII
-          chars[i++] = '\xC4';                       // these characters are assigned two bytes
+        if (i == end - 1 && ch >= '\x7F') ch = last_char;  // last element ASCII only.
+        if (ch >= '\x7F') {                                // x7F is at the top edge of ASCII
+          chars[i++] = '\xC4';  // these characters are assigned two bytes
           ch         = (ch >> 2) | 0x80;
         }
       }
@@ -487,8 +493,14 @@ std::unique_ptr<cudf::column> create_random_utf8_string_column(data_profile cons
                                                                cuda::std::philox4x32& engine,
                                                                cudf::size_type num_rows)
 {
-  auto len_dist =
-    random_value_fn<uint32_t>{profile.get_distribution_params<cudf::string_view>().length_params};
+  auto const string_params = profile.get_distribution_params<cudf::string_view>();
+  auto const char_lower    = string_params.char_lower;
+  auto const char_upper    = Encoding == string_encoding::ASCII
+                               ? std::min<unsigned char>(string_params.char_upper, 126)
+                               : string_params.char_upper;
+  CUDF_EXPECTS(char_lower <= char_upper, "Character range lower bound exceeds the ASCII range");
+
+  auto len_dist   = random_value_fn<uint32_t>{string_params.length_params};
   auto valid_dist = random_value_fn<bool>(
     distribution_params<bool>{1. - profile.get_null_probability().value_or(0)});
   auto lengths   = len_dist(engine, num_rows + 1);
@@ -513,7 +525,7 @@ std::unique_ptr<cudf::column> create_random_utf8_string_column(data_profile cons
   thrust::for_each_n(thrust::device,
                      cuda::make_zip_iterator(cuda::std::make_tuple(offsets_itr, offsets_itr + 1)),
                      num_rows,
-                     string_generator<Encoding>{chars.data(), engine});
+                     string_generator<Encoding>{chars.data(), engine, char_lower, char_upper});
 
   auto [result_bitmask, null_count] =
     profile.get_null_probability().has_value()
