@@ -452,17 +452,15 @@ struct string_generator {
   char* chars;
   cuda::std::philox4x32 engine;
   cuda::std::uniform_int_distribution<unsigned char> char_dist;
-  unsigned char last_char;  // replaces a multi-byte character that would not fit at the end
+  unsigned char last_char;  // replaces a multi-byte character that would not fit at the end;
+                            // char_lower is always ASCII so it is within the range
   // With the default range of 32-137: ~90% ASCII, ~10% UTF-8.
   // Characters 32-126 are ASCII; 127 and above will be multi-byte UTF-8
   string_generator(char* c,
                    cuda::std::philox4x32& engine,
                    unsigned char char_lower,
                    unsigned char char_upper)
-    : chars(c),
-      engine(engine),
-      char_dist(char_lower, char_upper),
-      last_char(char_lower < '\x7F' ? char_lower : ' ')
+    : chars(c), engine(engine), char_dist(char_lower, char_upper), last_char(char_lower)
   {
   }
   __device__ void operator()(cuda::std::tuple<int64_t, int64_t> str_begin_end)
@@ -498,7 +496,6 @@ std::unique_ptr<cudf::column> create_random_utf8_string_column(data_profile cons
   auto const char_upper    = Encoding == string_encoding::ASCII
                                ? std::min<unsigned char>(string_params.char_upper, 126)
                                : string_params.char_upper;
-  CUDF_EXPECTS(char_lower <= char_upper, "Character range lower bound exceeds the ASCII range");
 
   auto len_dist   = random_value_fn<uint32_t>{string_params.length_params};
   auto valid_dist = random_value_fn<bool>(
@@ -1206,6 +1203,8 @@ void data_profile::set_struct_types(cudf::host_span<cudf::type_id const> types)
 void data_profile::set_string_char_range(unsigned char lower, unsigned char upper)
 {
   CUDF_EXPECTS(lower <= upper, "Lower bound must be <= upper bound");
+  // a single-byte character is needed to end a string when a 2-byte character does not fit
+  CUDF_EXPECTS(lower < 127, "Lower bound must be an ASCII character (< 127)");
   string_dist_desc.char_lower = lower;
   string_dist_desc.char_upper = upper;
 }
