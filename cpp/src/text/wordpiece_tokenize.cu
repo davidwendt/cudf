@@ -57,35 +57,86 @@ using string_hasher_type = cudf::hashing::detail::MurmurHash3_x86_32<cudf::strin
 using hash_value_type    = string_hasher_type::result_type;
 
 /**
- * @brief Hasher used for vocabulary map
+ * @brief Key type for the vocabulary maps
+ *
+ * The hash of the vocabulary entry is stored in the upper 32 bits and
+ * the row index of the entry is stored in the lower 32 bits.
+ * Storing the hash allows most non-matching entries to be rejected
+ * without comparing the strings.
+ */
+using map_key_type = int64_t;
+
+__device__ map_key_type make_map_key(hash_value_type hash, cudf::size_type row)
+{
+  return static_cast<map_key_type>((static_cast<uint64_t>(hash) << 32) |
+                                   static_cast<uint32_t>(row));
+}
+__device__ hash_value_type key_hash(map_key_type key)
+{
+  return static_cast<hash_value_type>(static_cast<uint64_t>(key) >> 32);
+}
+__device__ cudf::size_type key_row(map_key_type key)
+{
+  return static_cast<cudf::size_type>(static_cast<uint64_t>(key) & 0xFFFF'FFFFu);
+}
+
+/**
+ * @brief String used to search the vocabulary maps along with its hash
+ */
+struct vocab_probe {
+  cudf::string_view str;
+  hash_value_type hash;
+};
+
+__device__ vocab_probe make_probe(cudf::string_view str)
+{
+  return {str, string_hasher_type{}(str)};
+}
+
+/**
+ * @brief Hasher used for the vocabulary maps
+ *
+ * The hash values are computed when the keys and probes are created.
  */
 struct vocab_hasher {
-  cudf::column_device_view const d_strings;
-  string_hasher_type hasher{};
-  __device__ hash_value_type operator()(cudf::size_type index) const
-  {
-    return hasher(d_strings.element<cudf::string_view>(index));
-  }
-  __device__ hash_value_type operator()(cudf::string_view const& s) const { return hasher(s); }
+  __device__ hash_value_type operator()(map_key_type key) const { return key_hash(key); }
+  __device__ hash_value_type operator()(vocab_probe const& probe) const { return probe.hash; }
 };
+
 /**
- * @brief Equality operator for vocabulary map
+ * @brief Equality operator for the vocabulary maps
+ *
+ * The vocabulary entries are compared after skipping `prefix_size` bytes.
+ * This allows the subword map to skip the '##' prefix of its entries.
  */
 struct vocab_equal {
   cudf::column_device_view const d_strings;
-  __device__ bool operator()(cudf::size_type lhs, cudf::size_type rhs) const noexcept
+  cudf::size_type prefix_size;
+  __device__ bool operator()(map_key_type lhs, map_key_type rhs) const noexcept
   {
     return lhs == rhs;  // all rows are expected to be unique
   }
-  __device__ bool operator()(cudf::string_view const& lhs, cudf::size_type rhs) const noexcept
+  __device__ bool operator()(vocab_probe const& lhs, map_key_type rhs) const noexcept
   {
-    return d_strings.element<cudf::string_view>(rhs) == lhs;
+    if (key_hash(rhs) != lhs.hash) { return false; }
+    auto const d_str = d_strings.element<cudf::string_view>(key_row(rhs));
+    return lhs.str ==
+           cudf::string_view(d_str.data() + prefix_size, d_str.size_bytes() - prefix_size);
   }
 };
 
+/**
+ * @brief Capacity of the vocabulary maps relative to the number of entries
+ *
+ * A low load factor reduces the number of slots checked for each lookup.
+ * Most lookups by the tokenizer are for prefixes not in the vocabulary
+ * and these must check slots until an empty one is found.
+ */
+constexpr std::size_t map_capacity_factor = 4;
+
 using cuco_storage        = cuco::storage<1>;
 using probe_scheme        = cuco::linear_probing<1, vocab_hasher>;
-using vocabulary_map_type = cuco::static_map<cudf::size_type,
+using vocabulary_map_type = cuco::static_map<map_key_type,
                                              cudf::size_type,
                                              cuco::extent<std::size_t>,
                                              cuda::thread_scope_thread,
@@ -93,50 +144,9 @@ using vocabulary_map_type = cuco::static_map<cudf::size_type,
                                              probe_scheme,
                                              rmm::mr::polymorphic_allocator<char>,
                                              cuco_storage>;
-
-/**
- * @brief Hasher used for the subword vocabulary map
- */
-struct sub_vocab_hasher {
-  cudf::column_device_view const d_strings;
-  string_hasher_type hasher{};
-  __device__ hash_value_type operator()(cudf::size_type index) const
-  {
-    auto const d_str = d_strings.element<cudf::string_view>(index);
-    // skip over the '##' prefix
-    return hasher(cudf::string_view(d_str.data() + 2, d_str.size_bytes() - 2));
-  }
-  __device__ hash_value_type operator()(cudf::string_view const& s) const { return hasher(s); }
-};
-/**
- * @brief Equality operator used for the subword vocabulary map
- *
- * The subwords start with '##' prefix in the original vocabulary map
- */
-struct sub_vocab_equal {
-  cudf::column_device_view const d_strings;
-  __device__ bool operator()(cudf::size_type lhs, cudf::size_type rhs) const noexcept
-  {
-    return lhs == rhs;  // all rows are expected to be unique
-  }
-  __device__ bool operator()(cudf::string_view const& lhs, cudf::size_type rhs) const noexcept
-  {
-    auto const d_str = d_strings.element<cudf::string_view>(rhs);
-    // skip over the '##' prefix
-    return lhs == cudf::string_view(d_str.data() + 2, d_str.size_bytes() - 2);
-  }
-};
-
-// This 2nd subword map helps avoid requiring temporary strings in device code
-using sub_probe_scheme        = cuco::linear_probing<1, sub_vocab_hasher>;
-using sub_vocabulary_map_type = cuco::static_map<cudf::size_type,
-                                                 cudf::size_type,
-                                                 cuco::extent<std::size_t>,
-                                                 cuda::thread_scope_thread,
-                                                 sub_vocab_equal,
-                                                 sub_probe_scheme,
-                                                 rmm::mr::polymorphic_allocator<char>,
-                                                 cuco_storage>;
+// This 2nd subword map holds the '##' entries without the prefix
+// which helps avoid requiring temporary strings in device code
+using sub_vocabulary_map_type = vocabulary_map_type;
 }  // namespace
 }  // namespace detail
 
@@ -176,13 +186,21 @@ struct wordpiece_vocabulary::wordpiece_vocabulary_impl {
 
 namespace {
 /**
- * @brief Identifies the column indices as the values in the vocabulary map
+ * @brief Creates the key and value for each vocabulary map entry
+ *
+ * The key holds the hash and the row index of the entry.
+ * The value is the row index which is also the token id.
  */
 struct key_pair {
-  __device__ cuco::pair<cudf::size_type, cudf::size_type> operator()(
+  cudf::column_device_view const d_strings;
+  cudf::size_type prefix_size;  // number of bytes to skip when hashing the entry
+  __device__ cuco::pair<detail::map_key_type, cudf::size_type> operator()(
     cudf::size_type idx) const noexcept
   {
-    return cuco::make_pair(idx, idx);
+    auto const d_str = d_strings.element<cudf::string_view>(idx);
+    auto const hash  = detail::string_hasher_type{}(
+      cudf::string_view(d_str.data() + prefix_size, d_str.size_bytes() - prefix_size));
+    return cuco::make_pair(detail::make_map_key(hash, idx), idx);
   }
 };
 
@@ -211,7 +229,7 @@ struct resolve_unk_id {
   {
     // look for both since the normalizer may change the case to match the vocab table
     auto const unk = idx == 0 ? cudf::string_view("[UNK]", 5) : cudf::string_view("[unk]", 5);
-    auto const fnd = d_map.find(unk);
+    auto const fnd = d_map.find(detail::make_probe(unk));
     return fnd != d_map.end() ? fnd->second : -1;
   }
 };
@@ -231,17 +249,17 @@ wordpiece_vocabulary::wordpiece_vocabulary(cudf::strings_column_view const& inpu
 
   // build the vocabulary map: each row is a single term and is the key for the map
   auto vocab_map = std::make_unique<detail::vocabulary_map_type>(
-    static_cast<size_t>(vocabulary->size() * 2),
-    cuco::empty_key{-1},
+    static_cast<std::size_t>(vocabulary->size()) * detail::map_capacity_factor,
+    cuco::empty_key{detail::map_key_type{-1}},
     cuco::empty_value{-1},
-    detail::vocab_equal{*d_vocabulary},
-    detail::probe_scheme{detail::vocab_hasher{*d_vocabulary}},
+    detail::vocab_equal{*d_vocabulary, 0},
+    detail::probe_scheme{detail::vocab_hasher{}},
     cuco::thread_scope_thread,
     detail::cuco_storage{},
     rmm::mr::polymorphic_allocator<char>{mr},
     stream.get());
   // the row index is the token id (data value for each key in the map)
-  auto iter = cudf::detail::make_counting_transform_iterator(0, key_pair{});
+  auto iter = cudf::detail::make_counting_transform_iterator(0, key_pair{*d_vocabulary, 0});
   vocab_map->insert_async(iter, iter + vocabulary->size(), stream.get());
   auto const zero_itr = cuda::counting_iterator<cudf::size_type>{0};
 
@@ -257,17 +275,17 @@ wordpiece_vocabulary::wordpiece_vocabulary(cudf::strings_column_view const& inpu
 
   // build a 2nd map with just the ## prefixed items
   auto vocab_sub_map = std::make_unique<detail::sub_vocabulary_map_type>(
-    sub_map_indices.size() * 2,
-    cuco::empty_key{-1},
+    sub_map_indices.size() * detail::map_capacity_factor,
+    cuco::empty_key{detail::map_key_type{-1}},
     cuco::empty_value{-1},
-    detail::sub_vocab_equal{*d_vocabulary},
-    detail::sub_probe_scheme{detail::sub_vocab_hasher{*d_vocabulary}},
+    detail::vocab_equal{*d_vocabulary, 2},
+    detail::probe_scheme{detail::vocab_hasher{}},
     cuco::thread_scope_thread,
     detail::cuco_storage{},
     rmm::mr::polymorphic_allocator<char>{mr},
     stream.get());
   // insert them without the '##' prefix since that is how they will be looked up
-  auto iter_sub = cuda::transform_iterator(sub_map_indices.begin(), key_pair{});
+  auto iter_sub = cuda::transform_iterator(sub_map_indices.begin(), key_pair{*d_vocabulary, 2});
   vocab_sub_map->insert_async(iter_sub, iter_sub + sub_map_indices.size(), stream.get());
 
   // prefetch the [unk] vocab entry
@@ -335,7 +353,7 @@ __device__ cudf::size_type find_longest_prefix(Tile const& tile,
     auto found       = false;
     if ((size > 0) && ((size == str.size_bytes()) ||
                        !cudf::strings::detail::is_utf8_continuation_char(str.data()[size]))) {
-      auto const itr = d_map.find(cudf::string_view(str.data(), size));
+      auto const itr = d_map.find(make_probe(cudf::string_view(str.data(), size)));
       if (itr != d_map.end()) {
         found       = true;
         found_token = itr->second;
@@ -490,6 +508,14 @@ struct all_words_fn {
     }
     return cudf::string_view(d_chars + start, static_cast<cudf::size_type>(end - start));
   }
+
+  /**
+   * @brief Returns the word at `idx` whose size is already known
+   */
+  __device__ cudf::string_view word(cudf::size_type idx, cudf::size_type size) const
+  {
+    return cudf::string_view(d_chars + d_starts[idx], size);
+  }
 };
 
 constexpr int32_t words_block_size = 256;
@@ -503,15 +529,15 @@ constexpr int32_t deferred_tile_size = 8;
  * Launched as a thread per word.
  *
  * Most words are found directly in the vocabulary and produce a single token.
- * Words that are not found are deferred to tokenize_deferred_kernel
- * and their count is set to 0.
+ * Words that are not found are deferred to tokenize_deferred_kernel,
+ * their count is set to 0, and their size (in bytes) is stored in `d_values`.
  *
  * @param words Returns the word for each index
  * @param num_words Number of words to tokenize
  * @param d_map Vocabulary of all words and sub-words
  * @param unk_id Unknown token id
  * @param d_counts Number of tokens for each word; 0 for deferred words
- * @param d_values Token for each word
+ * @param d_values Token for each word or the size of each deferred word
  */
 template <typename WordsFn, typename MapRefType>
 CUDF_KERNEL void tokenize_words_kernel(WordsFn words,
@@ -531,10 +557,12 @@ CUDF_KERNEL void tokenize_words_kernel(WordsFn words,
     count = 1;
     value = unk_id;
   } else if (!word.empty()) {
-    auto const itr = d_map.find(word);
+    auto const itr = d_map.find(make_probe(word));
     if (itr != d_map.end()) {
       count = 1;
       value = itr->second;
+    } else {
+      value = word.size_bytes();  // deferred words keep their size for tokenize_deferred_kernel
     }
   }
   d_counts[idx] = count;
@@ -561,7 +589,7 @@ CUDF_KERNEL void tokenize_words_kernel(WordsFn words,
  * @param d_sub_map Partial vocabulary of '##' entries
  * @param unk_id Unknown token id
  * @param d_counts Number of tokens for each word
- * @param d_values Token or overflow position for each word
+ * @param d_values Size of each deferred word; set to the token or overflow position for each word
  * @param d_overflow Tokens for words with more than one token
  * @param d_overflow_size Number of tokens needed for `d_overflow`
  */
@@ -584,7 +612,7 @@ CUDF_KERNEL void tokenize_deferred_kernel(WordsFn words,
   auto const active = tid < static_cast<cudf::thread_index_type>(d_deferred.size());
 
   auto const word_idx = active ? d_deferred[tid] : 0;
-  auto const word     = active ? words(word_idx) : cudf::string_view{};
+  auto const word     = active ? words.word(word_idx, d_values[word_idx]) : cudf::string_view{};
 
   tile_tokens_fn tokens{lane};
   wp_tokenize_fn(tile, word, d_map, d_sub_map, unk_id, tokens);
