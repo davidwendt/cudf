@@ -16,11 +16,13 @@
 #include <cudf/detail/sizes_to_offsets_iterator.cuh>
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/grid_1d.cuh>
+#include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/hashing/detail/murmurhash3_x86_32.cuh>
 #include <cudf/lists/detail/lists_column_factories.hpp>
 #include <cudf/strings/detail/utilities.hpp>
 #include <cudf/strings/string_view.cuh>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -35,9 +37,10 @@
 #include <cub/device/device_segmented_reduce.cuh>
 #include <cuco/static_map.cuh>
 #include <cuda/atomic>
-#include <cuda/buffer>
 #include <cuda/functional>
 #include <cuda/iterator>
+#include <cuda/memory_resource>
+#include <cuda/std/execution>
 #include <cuda/std/functional>
 #include <cuda/std/iterator>
 #include <cuda/std/limits>
@@ -59,25 +62,30 @@ using hash_value_type    = string_hasher_type::result_type;
 /**
  * @brief Key type for the vocabulary maps
  *
- * The hash of the vocabulary entry is stored in the upper 32 bits and
- * the row index of the entry is stored in the lower 32 bits.
+ * The hash of the vocabulary entry is stored in the upper bits and
+ * the row index of the entry is stored in the lower bits.
  * Storing the hash allows most non-matching entries to be rejected
  * without comparing the strings.
  */
 using map_key_type = int64_t;
 
+/// Number of bits the hash is shifted to place it in the upper bits of the key
+constexpr int key_hash_shift = cuda::std::numeric_limits<hash_value_type>::digits;
+/// Mask for the row index in the lower bits of the key
+constexpr uint64_t key_row_mask = (uint64_t{1} << key_hash_shift) - 1;
+
 __device__ map_key_type make_map_key(hash_value_type hash, cudf::size_type row)
 {
-  return static_cast<map_key_type>((static_cast<uint64_t>(hash) << 32) |
+  return static_cast<map_key_type>((static_cast<uint64_t>(hash) << key_hash_shift) |
                                    static_cast<uint32_t>(row));
 }
 __device__ hash_value_type key_hash(map_key_type key)
 {
-  return static_cast<hash_value_type>(static_cast<uint64_t>(key) >> 32);
+  return static_cast<hash_value_type>(static_cast<uint64_t>(key) >> key_hash_shift);
 }
 __device__ cudf::size_type key_row(map_key_type key)
 {
-  return static_cast<cudf::size_type>(static_cast<uint64_t>(key) & 0xFFFF'FFFFu);
+  return static_cast<cudf::size_type>(static_cast<uint64_t>(key) & key_row_mask);
 }
 
 /**
@@ -471,12 +479,17 @@ struct device_tokens_fn {
   }
 };
 
+/// Number of bits in each word of the row-start bitmask
+constexpr int64_t row_starts_word_bits = cudf::detail::size_in_bits<cudf::bitmask_type>();
+
 /**
  * @brief Returns true if `pos` is the first byte of a row
+ *
+ * The cudf bit utilities are not used since `pos` may exceed the range of `size_type`.
  */
-__device__ bool is_row_start(uint32_t const* d_row_starts, int64_t pos)
+__device__ bool is_row_start(cudf::bitmask_type const* d_row_starts, int64_t pos)
 {
-  return (d_row_starts[pos / 32] >> (pos % 32)) & 1u;
+  return (d_row_starts[pos / row_starts_word_bits] >> (pos % row_starts_word_bits)) & 1u;
 }
 
 /**
@@ -489,14 +502,15 @@ struct all_words_fn {
   char const* d_chars;
   int64_t chars_size;
   int64_t const* d_starts;
-  uint32_t const* d_row_starts;
+  cudf::bitmask_type const* d_row_starts;
   __device__ cudf::string_view operator()(cudf::size_type idx) const
   {
     auto const start = d_starts[idx];
     auto last        = cuda::std::min(chars_size, start + max_word_size);
     // the word cannot extend past the start of the next row
-    for (auto pos = start + 1; pos < last; pos = ((pos / 32) + 1) * 32) {
-      auto const bits = d_row_starts[pos / 32] >> (pos % 32);
+    for (auto pos = start + 1; pos < last;
+         pos      = cudf::util::round_up_unsafe(pos + 1, row_starts_word_bits)) {
+      auto const bits = d_row_starts[pos / row_starts_word_bits] >> (pos % row_starts_word_bits);
       if (bits != 0) {
         last = cuda::std::min(last, pos + __ffs(bits) - 1);
         break;
@@ -519,6 +533,9 @@ struct all_words_fn {
 };
 
 constexpr int32_t words_block_size = 256;
+
+/// Mask for all the threads in a warp used with the warp-level intrinsics
+constexpr uint32_t all_lanes = 0xFFFF'FFFFu;
 
 /// Number of threads cooperating to tokenize each deferred word
 constexpr int32_t deferred_tile_size = 8;
@@ -621,7 +638,6 @@ CUDF_KERNEL void tokenize_deferred_kernel(WordsFn words,
   // Reserve space in d_overflow for the words with more than one token.
   // This only synchronizes within the warp since the tokenize time varies by word.
   constexpr auto warp_size = cudf::detail::warp_size;
-  constexpr auto all_lanes = 0xFFFF'FFFFu;
   auto const warp_lane     = threadIdx.x % warp_size;
   auto const needed        = static_cast<int64_t>((lane == 0 && count > 1) ? count : 0);
   auto offset              = needed;  // inclusive scan within the warp
@@ -862,19 +878,17 @@ std::unique_ptr<cudf::column> make_tokens_column(tokenized_words&& tokens,
   // compute the token counts for each row by doing a segmented reduce over the word counts
   auto d_token_counts = rmm::device_uvector<cudf::size_type>(input.size(), stream);
   {
-    auto const d_in = cuda::transform_iterator(
-      tokens.counts.data(),
-      cuda::proclaim_return_type<cudf::size_type>(
-        [] __device__(uint8_t count) -> cudf::size_type { return count; }));
+    // the uint8 counts are accumulated using the output type
+    auto const mr_prop     = cuda::std::execution::prop{cuda::mr::get_memory_resource,
+                                                    cudf::get_current_device_resource_ref()};
+    auto const env         = cuda::std::execution::env{stream, mr_prop};
     auto const d_row_words = tokens.row_words.data();
-    auto temp              = std::size_t{0};
-    auto d_out             = d_token_counts.data();
-    cub::DeviceSegmentedReduce::Sum(
-      nullptr, temp, d_in, d_out, input.size(), d_row_words, d_row_words + 1, stream.get());
-    auto d_temp = cuda::device_buffer<std::byte>{
-      stream, cudf::get_current_device_resource_ref(), temp, cuda::no_init};
-    cub::DeviceSegmentedReduce::Sum(
-      d_temp.data(), temp, d_in, d_out, input.size(), d_row_words, d_row_words + 1, stream.get());
+    CUDF_CUDA_TRY(cub::DeviceSegmentedReduce::Sum(tokens.counts.data(),
+                                                  d_token_counts.data(),
+                                                  input.size(),
+                                                  d_row_words,
+                                                  d_row_words + 1,
+                                                  env));
   }
 
   auto [token_offsets, total_count] = cudf::detail::make_offsets_child_column(
@@ -921,14 +935,15 @@ std::unique_ptr<cudf::column> make_tokens_column(tokenized_words&& tokens,
  * @param stream Stream used for device allocations and kernel launches
  * @return Bits set for the first byte of each row
  */
-rmm::device_uvector<uint32_t> make_row_starts(cudf::strings_column_view const& input,
-                                              int64_t first_offset,
-                                              int64_t chars_size,
-                                              cuda::stream_ref stream)
+rmm::device_uvector<cudf::bitmask_type> make_row_starts(cudf::strings_column_view const& input,
+                                                        int64_t first_offset,
+                                                        int64_t chars_size,
+                                                        cuda::stream_ref stream)
 {
-  auto d_row_starts = rmm::device_uvector<uint32_t>((chars_size + 31) / 32, stream);
-  CUDF_CUDA_TRY(
-    cudaMemsetAsync(d_row_starts.data(), 0, d_row_starts.size() * sizeof(uint32_t), stream.get()));
+  auto d_row_starts = rmm::device_uvector<cudf::bitmask_type>(
+    cudf::util::div_rounding_up_safe(chars_size, row_starts_word_bits), stream);
+  CUDF_CUDA_TRY(cudaMemsetAsync(
+    d_row_starts.data(), 0, d_row_starts.size() * sizeof(cudf::bitmask_type), stream.get()));
   auto const input_offsets =
     cudf::detail::offsetalator_factory::make_input_iterator(input.offsets(), input.offset());
   thrust::for_each_n(
@@ -939,8 +954,10 @@ rmm::device_uvector<uint32_t> make_row_starts(cudf::strings_column_view const& i
       cudf::size_type idx) {
       auto const pos = input_offsets[idx] - first_offset;
       if (pos >= chars_size) { return; }
-      cuda::atomic_ref<uint32_t, cuda::thread_scope_device>{d_row_starts[pos / 32]}.fetch_or(
-        1u << (pos % 32), cuda::memory_order_relaxed);
+      cuda::atomic_ref<cudf::bitmask_type, cuda::thread_scope_device>{
+        d_row_starts[pos / row_starts_word_bits]}
+        .fetch_or(cudf::bitmask_type{1} << (pos % row_starts_word_bits),
+                  cuda::memory_order_relaxed);
     });
   return d_row_starts;
 }
@@ -1032,7 +1049,7 @@ CUDF_KERNEL void find_row_words_kernel(cudf::column_device_view const d_strings,
          pos += cudf::detail::warp_size) {
       auto const p        = pos + static_cast<cudf::size_type>(lane);
       auto const is_start = (p < size) && (begin[p] != ' ') && ((p == 0) || (begin[p - 1] == ' '));
-      auto const mask     = __ballot_sync(0xFFFF'FFFFu, is_start);
+      auto const mask     = __ballot_sync(all_lanes, is_start);
       auto const word_idx = count + __popc(mask & ((1u << lane) - 1u));
       if (is_start && (word_idx < max_words) && (d_starts != nullptr)) {
         d_starts[d_offsets[row] + word_idx] = offset + p;
