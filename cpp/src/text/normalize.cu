@@ -33,9 +33,11 @@
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_segmented_reduce.cuh>
-#include <cuda/buffer>
+#include <cub/device/device_transform.cuh>
 #include <cuda/functional>
 #include <cuda/iterator>
+#include <cuda/memory_resource>
+#include <cuda/std/execution>
 #include <cuda/std/iterator>
 #include <cuda/stream>
 #include <thrust/binary_search.h>
@@ -481,28 +483,14 @@ struct normalize_fn {
     if ((idx < total_bytes) && (d_matches != nullptr) && has_matches(idx, matches, base)) {
       fix_special_tokens(idx, replacement, matches, base);
     }
+    // count the non-zero bytes: __vcmpne4 sets each non-zero byte to 0xFF
     int32_t size = 0;
     for (uint32_t k = 0; k < MAX_NEW_CHARS; ++k) {
-      auto const v = replacement[k];
-      size += ((v & 0xFF) > 0) + ((v & 0xFF00) > 0) + ((v & 0xFF0000) > 0) + ((v & 0xFF000000) > 0);
+      size += __popc(__vcmpne4(replacement[k], 0)) / 8;
     }
     return size;
   }
 };
-
-/**
- * @brief Locates the special tokens in the input
- *
- * Launched as a thread per input byte (total_bytes).
- *
- * @param fn Normalizes each input byte
- * @param d_matches Result of find_special_token for each input byte
- */
-CUDF_KERNEL void special_tokens_kernel(normalize_fn fn, uint8_t* d_matches)
-{
-  auto const idx = cudf::detail::grid_1d::global_thread_id();
-  if (idx < fn.total_bytes) { d_matches[idx] = fn.find_special_token(idx); }
-}
 
 /// Number of find_special_token results loaded by each block (multiple of 8)
 constexpr int64_t block_matches_size = block_size + 16;
@@ -550,6 +538,8 @@ CUDF_KERNEL void normalized_sizes_kernel(normalize_fn fn, uint8_t* d_sizes, int6
   auto const size = fn(idx, replacement, block_matches, base);
   if (idx < fn.total_bytes) { d_sizes[idx] = static_cast<uint8_t>(size); }
 
+  // CUB is used for the block-wide collectives in these kernels since the cooperative_groups
+  // equivalents require a multi-warp tile which measured slower and reports racecheck hazards
   using block_reduce = cub::BlockReduce<int32_t, block_size>;
   __shared__ typename block_reduce::TempStorage temp_storage;
   auto const block_total = block_reduce(temp_storage).Sum(size);
@@ -580,6 +570,7 @@ CUDF_KERNEL void normalized_chars_kernel(normalize_fn fn,
   uint32_t replacement[MAX_NEW_CHARS];
   auto const size = fn(idx, replacement, block_matches, base);
 
+  // cub::BlockScan also returns the block total needed to write the block's output
   using block_scan = cub::BlockScan<int32_t, block_size>;
   __shared__ typename block_scan::TempStorage temp_storage;
   __shared__ char block_output[block_size * MAX_NEW_CHARS * sizeof(uint32_t)];
@@ -625,32 +616,23 @@ rmm::device_uvector<cudf::size_type> compute_sizes(cudf::device_span<uint8_t con
 {
   auto output_sizes = rmm::device_uvector<cudf::size_type>(size, stream);
 
-  auto d_in = cuda::transform_iterator(
-    d_sizes.data(),
-    cuda::proclaim_return_type<cudf::size_type>(
-      [] __device__(uint8_t v) -> cudf::size_type { return static_cast<cudf::size_type>(v); }));
-
-  // DeviceSegmentedReduce is used to compute the size of each output row
-  auto d_out = output_sizes.begin();
-  auto temp  = std::size_t{0};
+  // DeviceSegmentedReduce is used to compute the size of each output row;
+  // the uint8 sizes are accumulated using the output type
+  auto const env =
+    cuda::std::execution::env{cuda::std::execution::prop{cuda::get_stream_t{}, stream},
+                              cuda::std::execution::prop{cuda::mr::get_memory_resource_t{},
+                                                         cudf::get_current_device_resource_ref()}};
+  auto const d_in  = d_sizes.data();
+  auto const d_out = output_sizes.begin();
   if (offset == 0) {
-    cub::DeviceSegmentedReduce::Sum(
-      nullptr, temp, d_in, d_out, size, offsets, offsets + 1, stream.get());
-    auto d_temp = cuda::device_buffer<std::byte>{
-      stream, cudf::get_current_device_resource_ref(), temp, cuda::no_init};
-    cub::DeviceSegmentedReduce::Sum(
-      d_temp.data(), temp, d_in, d_out, size, offsets, offsets + 1, stream.get());
+    CUDF_CUDA_TRY(cub::DeviceSegmentedReduce::Sum(d_in, d_out, size, offsets, offsets + 1, env));
   } else {
     // offsets need to be normalized for segmented-reduce to work efficiently
     auto offsets_itr = cuda::transform_iterator(
       offsets,
       cuda::proclaim_return_type<int64_t>([offset] __device__(auto o) { return o - offset; }));
-    cub::DeviceSegmentedReduce::Sum(
-      nullptr, temp, d_in, d_out, size, offsets_itr, offsets_itr + 1, stream.get());
-    auto d_temp = cuda::device_buffer<std::byte>{
-      stream, cudf::get_current_device_resource_ref(), temp, cuda::no_init};
-    cub::DeviceSegmentedReduce::Sum(
-      d_temp.data(), temp, d_in, d_out, size, offsets_itr, offsets_itr + 1, stream.get());
+    CUDF_CUDA_TRY(
+      cub::DeviceSegmentedReduce::Sum(d_in, d_out, size, offsets_itr, offsets_itr + 1, env));
   }
 
   return output_sizes;
@@ -702,9 +684,12 @@ std::unique_ptr<cudf::column> normalize_characters(cudf::strings_column_view con
   // locate any special tokens so their padding can be removed when normalizing
   auto d_matches = rmm::device_uvector<uint8_t>(special_tokens.empty() ? 0 : chars_size, stream);
   if (!special_tokens.empty()) {
-    special_tokens_kernel<<<grid.num_blocks, grid.num_threads_per_block, 0, stream.get()>>>(
-      fn, d_matches.data());
-    CUDF_CUDA_TRY(cudaGetLastError());
+    CUDF_CUDA_TRY(cub::DeviceTransform::Transform(
+      cuda::counting_iterator<int64_t>{0},
+      d_matches.begin(),
+      chars_size,
+      [fn] __device__(int64_t idx) -> uint8_t { return fn.find_special_token(idx); },
+      stream.get()));
     fn.d_matches = d_matches.data();
   }
 
