@@ -14,7 +14,9 @@
 #include <cudf/detail/null_mask.hpp>
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/sizes_to_offsets_iterator.cuh>
+#include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/grid_1d.cuh>
+#include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/detail/converters.hpp>
 #include <cudf/strings/detail/strings_children.cuh>
@@ -42,6 +44,7 @@
 #include <cuda/std/algorithm>
 #include <cuda/std/execution>
 #include <cuda/std/span>
+#include <cuda/std/utility>
 #include <cuda/stream>
 #include <thrust/execution_policy.h>
 #include <thrust/for_each.h>
@@ -661,51 +664,119 @@ CUDF_KERNEL void decompose_fill_kernel(decompose_fn fn,
 }
 
 /**
- * Stable-sort combining mark runs within a string's codepoint slice.
- * One invocation per string; insertion-sort each maximal run of CCC>0 marks.
- * d_cps holds packed (cp | ccc) slots; CCC is extracted from the packed value.
+ * Canonical reordering of runs of combining marks (CCC>0).
+ *
+ * The runs never cross a row boundary so they are located with the row offsets of the
+ * packed slots. Only runs of 2 or more marks need sorting and these are independent of
+ * each other so each run is sorted by its own thread.
  */
 struct reorder_fn {
   cuda::std::span<uint32_t> d_cps;  // packed cp+ccc slots
   cuda::std::span<int64_t const> d_str_cp_offsets;
 
-  __device__ void operator()(cudf::size_type str_idx) const
+  /// Returns the [start, end) slots of the row containing slot @p idx
+  __device__ cuda::std::pair<int64_t, int64_t> row_bounds(int64_t idx) const
   {
-    auto const cp_start = d_str_cp_offsets[str_idx];
-    auto const cp_end   = d_str_cp_offsets[str_idx + 1];
-    auto run_start      = cp_start;
-    for (int64_t i = cp_start; i <= cp_end; ++i) {
-      bool const is_combining = (i < cp_end) && (ccc_of(d_cps[i]) > 0);
-      if (is_combining) { continue; }
-      auto const run_len = i - run_start;
-      if (run_len > 1) {
-        // Insertion sort: upper_bound locates the insertion point by CCC, then
-        // a single rotate on the packed array moves both cp and ccc together.
-        for (int64_t j = run_start + 1; j < i; ++j) {
-          auto const ccc_j = ccc_of(d_cps[j]);
-          // upper_bound(begin, end, value, comp): returns first element where comp(value, elem)
-          // is true, i.e., first packed slot whose CCC exceeds ccc_j.
-          auto const ins = cuda::std::upper_bound(
-                             d_cps.begin() + run_start,
-                             d_cps.begin() + j,
-                             ccc_j,
-                             [](uint8_t val, uint32_t packed) { return val < ccc_of(packed); }) -
-                           d_cps.begin();
-          if (ins < j) {
-            cuda::std::rotate(d_cps.begin() + ins, d_cps.begin() + j, d_cps.begin() + j + 1);
-          }
-        }
+    // the last row offset <= idx identifies the (non-empty) row containing idx
+    auto const itr =
+      cuda::std::upper_bound(d_str_cp_offsets.begin(), d_str_cp_offsets.end(), idx) - 1;
+    return {*itr, *(itr + 1)};
+  }
+
+  /// Returns true if slot @p idx is the first mark of a run of 2 or more combining marks
+  __device__ bool is_run_start(int64_t idx) const
+  {
+    auto const size = static_cast<int64_t>(d_cps.size());
+    if (ccc_of(d_cps[idx]) == 0 || idx + 1 >= size || ccc_of(d_cps[idx + 1]) == 0) { return false; }
+    auto const [row_start, row_end] = row_bounds(idx);
+    if (idx + 1 >= row_end) { return false; }
+    return idx == row_start || ccc_of(d_cps[idx - 1]) == 0;
+  }
+
+  /// Stable-sorts the run of combining marks starting at slot @p run_start by CCC
+  __device__ void operator()(int64_t run_start) const
+  {
+    auto const row_end = row_bounds(run_start).second;
+    auto run_end       = run_start + 1;
+    while (run_end < row_end && ccc_of(d_cps[run_end]) > 0) {
+      ++run_end;
+    }
+    // Insertion sort: upper_bound locates the insertion point by CCC, then
+    // a single rotate on the packed array moves both cp and ccc together.
+    for (int64_t j = run_start + 1; j < run_end; ++j) {
+      auto const ccc_j = ccc_of(d_cps[j]);
+      // upper_bound(begin, end, value, comp): returns first element where comp(value, elem)
+      // is true, i.e., first packed slot whose CCC exceeds ccc_j.
+      auto const ins =
+        cuda::std::upper_bound(d_cps.begin() + run_start,
+                               d_cps.begin() + j,
+                               ccc_j,
+                               [](uint8_t val, uint32_t packed) { return val < ccc_of(packed); }) -
+        d_cps.begin();
+      if (ins < j) {
+        cuda::std::rotate(d_cps.begin() + ins, d_cps.begin() + j, d_cps.begin() + j + 1);
       }
-      run_start = i + 1;
+    }
+  }
+};
+
+constexpr int32_t mark_block_size       = 256;
+constexpr int32_t mark_items_per_thread = 4;
+
+/**
+ * @brief Marks the first slot of each run of 2 or more combining marks
+ *
+ * Each block processes `mark_block_size * mark_items_per_thread` slots with each thread
+ * loading slots a block-width apart so the loads are coalesced and independent.
+ * Each warp writes the flags of 32 consecutive slots as a single bitmask word.
+ *
+ * @param fn Reorders the runs of combining marks
+ * @param d_run_starts Output bit per slot set for each run start
+ */
+CUDF_KERNEL void mark_run_starts_kernel(reorder_fn fn, cudf::bitmask_type* d_run_starts)
+{
+  auto const size = static_cast<int64_t>(fn.d_cps.size());
+  auto const base = static_cast<int64_t>(blockIdx.x) * mark_block_size * mark_items_per_thread +
+                    static_cast<int64_t>(threadIdx.x);
+
+  uint32_t slots[mark_items_per_thread];
+  for (int32_t k = 0; k < mark_items_per_thread; ++k) {
+    auto const idx = base + k * mark_block_size;
+    slots[k]       = idx < size ? fn.d_cps[idx] : 0u;
+  }
+  for (int32_t k = 0; k < mark_items_per_thread; ++k) {
+    auto const idx  = base + k * mark_block_size;
+    bool const flag = ccc_of(slots[k]) > 0 && fn.is_run_start(idx);
+    auto const bits = __ballot_sync(0xFFFF'FFFFu, flag);
+    if ((threadIdx.x % cudf::detail::warp_size) == 0 && idx < size) {
+      d_run_starts[idx / cudf::detail::warp_size] = bits;
+    }
+  }
+}
+
+/**
+ * @brief Sorts the runs of combining marks marked in a bitmask word
+ */
+struct sort_marked_runs_fn {
+  reorder_fn reorder;
+  cudf::bitmask_type const* d_run_starts;
+
+  __device__ void operator()(int64_t word_idx) const
+  {
+    auto bits = d_run_starts[word_idx];
+    while (bits != 0) {
+      auto const bit = __ffs(bits) - 1;
+      reorder(word_idx * cudf::detail::warp_size + bit);
+      bits &= bits - 1;
     }
   }
 };
 
 /**
  * Canonical composition pass (NFC/NFKC only).
- * One invocation per string.  The composition table is small (~600 entries,
- * ~7 KB) and accessed by all strings, so it stays L2-hot throughout execution.
- * Consumed slots are marked with PACKED_CONSUMED_BIT and skipped by output_fn.
+ * One invocation per string.  The composition table is small (about 1K entries,
+ * ~12 KB) and accessed by all strings, so it stays L2-hot throughout execution.
+ * Consumed slots are marked with PACKED_CONSUMED_BIT and contribute no output bytes.
  * Composed starters always have CCC=0, so pack_cp_ccc(composed, 0) needs no
  * additional CCC table lookup.
  */
@@ -773,23 +844,6 @@ struct compose_fn {
       }
       last_class = ccc;
     }
-  }
-};
-
-/**
- * Fused canonical reorder + composition for NFC/NFKC.
- * One thread per string reorders and then immediately composes its codepoint
- * interval, eliminating a kernel launch and giving composition a warm L2 cache
- * for the row just touched by reorder.
- */
-struct reorder_and_compose_fn {
-  reorder_fn reorder;
-  compose_fn compose;
-
-  __device__ void operator()(cudf::size_type str_idx) const
-  {
-    reorder(str_idx);
-    compose(str_idx);
   }
 };
 
@@ -982,22 +1036,38 @@ std::unique_ptr<cudf::column> normalize_unicode(cudf::strings_column_view const&
   auto const d_cps = cuda::std::span<uint32_t>(cps.data(), cps.size());
   auto const d_scp = cuda::std::span<int64_t const>(str_cp_offsets.data(), str_cp_offsets.size());
 
-  // Canonical Reorder + Composition:
-  // For NFC/NFKC, fuse reorder and compose in one launch so each thread
-  // composes its row immediately after reordering, while the data is still hot.
-  // For NFD/NFKD, only the reorder step is needed.
-  auto const row_iter = cuda::make_counting_iterator(cudf::size_type{0});
+  // Canonical reordering: mark the start of each run of 2 or more combining marks and then
+  // sort each marked run. The runs are marked before sorting so no slot is read while it is
+  // being sorted.
+  if (!cps.empty()) {
+    auto const reorder   = detail::reorder_fn{d_cps, d_scp};
+    auto const num_slots = static_cast<int64_t>(cps.size());
+    auto const num_words =
+      cudf::util::div_rounding_up_safe(num_slots, static_cast<int64_t>(cudf::detail::warp_size));
+    auto run_starts = cuda::device_buffer<cudf::bitmask_type>{
+      stream, temp_mr, static_cast<std::size_t>(num_words), cuda::no_init};
+    auto const num_blocks = cudf::util::div_rounding_up_safe(
+      num_slots, static_cast<int64_t>(detail::mark_block_size * detail::mark_items_per_thread));
+    detail::mark_run_starts_kernel<<<num_blocks, detail::mark_block_size, 0, stream.get()>>>(
+      reorder, run_starts.data());
+    CUDF_CUDA_TRY(cudaGetLastError());
+    thrust::for_each_n(policy,
+                       cuda::make_counting_iterator(int64_t{0}),
+                       num_words,
+                       detail::sort_marked_runs_fn{reorder, run_starts.data()});
+  }
+
+  // Canonical composition (NFC/NFKC only)
   if (p.form == unicode_normalization_form::NFC || p.form == unicode_normalization_form::NFKC) {
-    auto fn =
-      detail::reorder_and_compose_fn{detail::reorder_fn{d_cps, d_scp},
-                                     detail::compose_fn{d_cps,
-                                                        d_scp,
-                                                        detail::as_span(p.comp_keys),
-                                                        detail::as_span(p.comp_values),
-                                                        detail::as_span(p.compat_decomp_flags)}};
-    thrust::for_each_n(policy, row_iter, num_rows, fn);
-  } else {
-    thrust::for_each_n(policy, row_iter, num_rows, detail::reorder_fn{d_cps, d_scp});
+    auto const row_iter = cuda::make_counting_iterator(cudf::size_type{0});
+    thrust::for_each_n(policy,
+                       row_iter,
+                       num_rows,
+                       detail::compose_fn{d_cps,
+                                          d_scp,
+                                          detail::as_span(p.comp_keys),
+                                          detail::as_span(p.comp_values),
+                                          detail::as_span(p.compat_decomp_flags)});
   }
 
   // Output: the UTF-8 width of each slot is summed per row for the output offsets
