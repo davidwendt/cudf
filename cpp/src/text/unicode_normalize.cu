@@ -37,6 +37,7 @@
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cub/device/device_segmented_reduce.cuh>
+#include <cuda/atomic>
 #include <cuda/buffer>
 #include <cuda/functional>
 #include <cuda/iterator>
@@ -720,24 +721,129 @@ struct reorder_fn {
   }
 };
 
+/**
+ * Canonical composition (NFC/NFKC only).
+ *
+ * The composition table is small (about 1K entries, ~12 KB) and accessed by all
+ * threads, so it stays L2-hot throughout execution. Consumed slots are marked with
+ * PACKED_CONSUMED_BIT and contribute no output bytes. Composed starters always have
+ * CCC=0, so pack_cp_ccc(composed, 0) needs no additional CCC table lookup.
+ *
+ * Composition runs left to right over a row's slots carrying a small state. A segment
+ * start is a starter that can never be composed with an earlier starter, so the state
+ * after it is the same no matter what preceded it. Composition also only modifies slots
+ * at or after the segment's first slot so the segments are composed independently.
+ */
+struct composer {
+  cuda::std::span<uint32_t> d_cps;  // packed cp+ccc slots
+  cuda::std::span<uint64_t const> comp_keys;
+  cuda::std::span<uint32_t const> comp_values;
+  cuda::std::span<cudf::bitmask_type const> compat_flags;  // NFC/NFKC quick-check bitset
+
+  struct state {
+    int64_t last_starter = -1;
+    uint8_t last_class   = 0;
+  };
+
+  /// Returns true if the slot is a starter that cannot be composed with an earlier starter
+  __device__ bool is_segment_start(uint32_t packed) const
+  {
+    if (ccc_of(packed) != 0) { return false; }
+    auto const cp = cp_of(packed);
+    // Hangul V and T jamo compose with a preceding L or LV syllable
+    if ((cp >= HANGUL_VBASE && cp <= HANGUL_VEND) || (cp >= HANGUL_TSTART && cp <= HANGUL_TEND)) {
+      return false;
+    }
+    // CCC=0 second operands of a composition are flagged when the table is built
+    return cp > MAX_CODEPOINT ||
+           !cudf::bit_is_set(compat_flags.data(), static_cast<cudf::size_type>(cp));
+  }
+
+  /// Composes slot @p i with the current state
+  __device__ void step(int64_t i, state& s) const
+  {
+    auto const packed_i = d_cps[i];
+    if (is_consumed(packed_i)) { return; }
+    uint8_t const ccc = ccc_of(packed_i);
+    if (s.last_starter < 0) {
+      s.last_starter = ccc == 0 ? i : s.last_starter;
+      s.last_class   = ccc;
+      return;
+    }
+    if (ccc == 0) {
+      // New starter — attempt composition only when unblocked (last_class == 0).
+      // Try Hangul algorithmic composition first, then the canonical table for
+      // starter+starter pairs (e.g. Bengali U+09C7 + U+09BE → U+09CB).
+      if (s.last_class == 0) {
+        auto const composed_hangul = hangul_compose(cp_of(d_cps[s.last_starter]), cp_of(packed_i));
+        if (composed_hangul != 0) {
+          d_cps[s.last_starter] = pack_cp_ccc(composed_hangul, 0);
+          d_cps[i]              = PACKED_CONSUMED_BIT;
+          return;
+        }
+        // Only codepoints flagged as CCC=0 second operands can match a table key here
+        auto const cp = cp_of(packed_i);
+        if (cp <= MAX_CODEPOINT &&
+            cudf::bit_is_set(compat_flags.data(), static_cast<cudf::size_type>(cp))) {
+          auto const key = composition_key(cp_of(d_cps[s.last_starter]), cp);
+          auto const it  = cuda::std::lower_bound(comp_keys.begin(), comp_keys.end(), key);
+          if (it != comp_keys.end() && *it == key) {
+            d_cps[s.last_starter] =
+              pack_cp_ccc(comp_values[cuda::std::distance(comp_keys.begin(), it)], 0);
+            d_cps[i] = PACKED_CONSUMED_BIT;
+            return;
+          }
+        }
+      }
+      s.last_starter = i;
+    } else {
+      // Combining mark: compose with last_starter
+      if (s.last_class < ccc) {
+        auto const key = composition_key(cp_of(d_cps[s.last_starter]), cp_of(packed_i));
+        auto const it  = cuda::std::lower_bound(comp_keys.begin(), comp_keys.end(), key);
+        if (it != comp_keys.end() && *it == key) {
+          d_cps[s.last_starter] =
+            pack_cp_ccc(comp_values[cuda::std::distance(comp_keys.begin(), it)], 0);
+          d_cps[i] = PACKED_CONSUMED_BIT;
+          return;
+        }
+      }
+    }
+    s.last_class = ccc;
+  }
+};
+
+__device__ inline bool is_bit_set(cudf::bitmask_type const* bits, int64_t idx)
+{
+  return (bits[idx / cudf::detail::warp_size] >> (idx % cudf::detail::warp_size)) & 1u;
+}
+
 constexpr int32_t mark_block_size       = 256;
 constexpr int32_t mark_items_per_thread = 4;
 
 /**
- * @brief Marks the first slot of each run of 2 or more combining marks
+ * @brief Marks the first slot of each run of 2 or more combining marks and,
+ * when composing, the composition segment starts
  *
  * Each block processes `mark_block_size * mark_items_per_thread` slots with each thread
  * loading slots a block-width apart so the loads are coalesced and independent.
  * Each warp writes the flags of 32 consecutive slots as a single bitmask word.
+ * The row starts are also segment starts and are added afterwards by mark_row_starts_fn.
  *
  * @param fn Reorders the runs of combining marks
+ * @param comp Composes the segments
  * @param d_run_starts Output bit per slot set for each run start
+ * @param d_segment_starts Output bit per slot set for each segment start (nullptr if not composing)
  */
-CUDF_KERNEL void mark_run_starts_kernel(reorder_fn fn, cudf::bitmask_type* d_run_starts)
+CUDF_KERNEL void mark_slots_kernel(reorder_fn fn,
+                                   composer comp,
+                                   cudf::bitmask_type* d_run_starts,
+                                   cudf::bitmask_type* d_segment_starts)
 {
   auto const size = static_cast<int64_t>(fn.d_cps.size());
   auto const base = static_cast<int64_t>(blockIdx.x) * mark_block_size * mark_items_per_thread +
                     static_cast<int64_t>(threadIdx.x);
+  bool const is_lane0 = (threadIdx.x % cudf::detail::warp_size) == 0;
 
   uint32_t slots[mark_items_per_thread];
   for (int32_t k = 0; k < mark_items_per_thread; ++k) {
@@ -745,11 +851,16 @@ CUDF_KERNEL void mark_run_starts_kernel(reorder_fn fn, cudf::bitmask_type* d_run
     slots[k]       = idx < size ? fn.d_cps[idx] : 0u;
   }
   for (int32_t k = 0; k < mark_items_per_thread; ++k) {
-    auto const idx  = base + k * mark_block_size;
-    bool const flag = ccc_of(slots[k]) > 0 && fn.is_run_start(idx);
-    auto const bits = __ballot_sync(0xFFFF'FFFFu, flag);
-    if ((threadIdx.x % cudf::detail::warp_size) == 0 && idx < size) {
-      d_run_starts[idx / cudf::detail::warp_size] = bits;
+    auto const idx       = base + k * mark_block_size;
+    bool const run_start = ccc_of(slots[k]) > 0 && fn.is_run_start(idx);
+    auto const run_bits  = __ballot_sync(0xFFFF'FFFFu, run_start);
+    if (is_lane0 && idx < size) { d_run_starts[idx / cudf::detail::warp_size] = run_bits; }
+    if (d_segment_starts != nullptr) {
+      bool const segment_start = idx < size && comp.is_segment_start(slots[k]);
+      auto const segment_bits  = __ballot_sync(0xFFFF'FFFFu, segment_start);
+      if (is_lane0 && idx < size) {
+        d_segment_starts[idx / cudf::detail::warp_size] = segment_bits;
+      }
     }
   }
 }
@@ -773,76 +884,42 @@ struct sort_marked_runs_fn {
 };
 
 /**
- * Canonical composition pass (NFC/NFKC only).
- * One invocation per string.  The composition table is small (about 1K entries,
- * ~12 KB) and accessed by all strings, so it stays L2-hot throughout execution.
- * Consumed slots are marked with PACKED_CONSUMED_BIT and contribute no output bytes.
- * Composed starters always have CCC=0, so pack_cp_ccc(composed, 0) needs no
- * additional CCC table lookup.
+ * @brief Marks the first slot of each non-empty row as a composition segment start
  */
-struct compose_fn {
-  cuda::std::span<uint32_t> d_cps;  // packed cp+ccc slots
-  cuda::std::span<int64_t const> d_str_cp_offsets;
-  cuda::std::span<uint64_t const> comp_keys;
-  cuda::std::span<uint32_t const> comp_values;
-  cuda::std::span<cudf::bitmask_type const> compat_flags;  // NFC/NFKC quick-check bitset
+struct mark_row_starts_fn {
+  int64_t const* d_str_cp_offsets;
+  cudf::bitmask_type* d_segment_starts;
 
-  __device__ void operator()(cudf::size_type str_idx) const
+  __device__ void operator()(cudf::size_type row) const
   {
-    auto const cp_start  = d_str_cp_offsets[str_idx];
-    auto const cp_end    = d_str_cp_offsets[str_idx + 1];
-    int64_t last_starter = -1;
-    uint8_t last_class   = 0;
+    auto const pos = d_str_cp_offsets[row];
+    if (pos == d_str_cp_offsets[row + 1]) { return; }
+    cuda::atomic_ref<cudf::bitmask_type, cuda::thread_scope_device> word(
+      d_segment_starts[pos / cudf::detail::warp_size]);
+    word.fetch_or(cudf::bitmask_type{1} << (pos % cudf::detail::warp_size),
+                  cuda::std::memory_order_relaxed);
+  }
+};
 
-    for (int64_t i = cp_start; i < cp_end; ++i) {
-      auto const packed_i = d_cps[i];
-      if (is_consumed(packed_i)) { continue; }
-      uint8_t const ccc = ccc_of(packed_i);
-      if (last_starter < 0) {
-        last_starter = ccc == 0 ? i : last_starter;
-        last_class   = ccc;
-        continue;
-      }
-      if (ccc == 0) {
-        // New starter — attempt composition only when unblocked (last_class == 0).
-        // Try Hangul algorithmic composition first, then the canonical table for
-        // starter+starter pairs (e.g. Bengali U+09C7 + U+09BE → U+09CB).
-        if (last_class == 0) {
-          auto const composed_hangul = hangul_compose(cp_of(d_cps[last_starter]), cp_of(packed_i));
-          if (composed_hangul != 0) {
-            d_cps[last_starter] = pack_cp_ccc(composed_hangul, 0);
-            d_cps[i]            = PACKED_CONSUMED_BIT;
-            continue;
-          }
-          // Only codepoints flagged as CCC=0 second operands can match a table key here
-          auto const cp = cp_of(packed_i);
-          if (cp <= MAX_CODEPOINT &&
-              cudf::bit_is_set(compat_flags.data(), static_cast<cudf::size_type>(cp))) {
-            auto const key = composition_key(cp_of(d_cps[last_starter]), cp);
-            auto const it  = cuda::std::lower_bound(comp_keys.begin(), comp_keys.end(), key);
-            if (it != comp_keys.end() && *it == key) {
-              d_cps[last_starter] =
-                pack_cp_ccc(comp_values[cuda::std::distance(comp_keys.begin(), it)], 0);
-              d_cps[i] = PACKED_CONSUMED_BIT;
-              continue;
-            }
-          }
-        }
-        last_starter = i;
-      } else {
-        // Combining mark: compose with last_starter
-        if (last_class < ccc) {
-          auto const key = composition_key(cp_of(d_cps[last_starter]), cp_of(packed_i));
-          auto const it  = cuda::std::lower_bound(comp_keys.begin(), comp_keys.end(), key);
-          if (it != comp_keys.end() && *it == key) {
-            d_cps[last_starter] =
-              pack_cp_ccc(comp_values[cuda::std::distance(comp_keys.begin(), it)], 0);
-            d_cps[i] = PACKED_CONSUMED_BIT;
-            continue;
-          }
-        }
-      }
-      last_class = ccc;
+/**
+ * @brief Composes the segment starting at a slot
+ *
+ * Launched as a thread per slot and only the threads at a segment start do any work.
+ * The segment starts are read from a bitmask built before composition so no thread
+ * reads a slot that another thread is composing.
+ */
+struct compose_segments_fn {
+  composer comp;
+  cudf::bitmask_type const* d_segment_starts;
+
+  __device__ void operator()(int64_t idx) const
+  {
+    if (!is_bit_set(d_segment_starts, idx)) { return; }
+    auto const size = static_cast<int64_t>(comp.d_cps.size());
+    composer::state s{};
+    comp.step(idx, s);
+    for (auto i = idx + 1; i < size && !is_bit_set(d_segment_starts, i); ++i) {
+      comp.step(i, s);
     }
   }
 };
@@ -1036,38 +1113,46 @@ std::unique_ptr<cudf::column> normalize_unicode(cudf::strings_column_view const&
   auto const d_cps = cuda::std::span<uint32_t>(cps.data(), cps.size());
   auto const d_scp = cuda::std::span<int64_t const>(str_cp_offsets.data(), str_cp_offsets.size());
 
-  // Canonical reordering: mark the start of each run of 2 or more combining marks and then
-  // sort each marked run. The runs are marked before sorting so no slot is read while it is
-  // being sorted.
+  // Canonical reordering and composition (NFC/NFKC only).
+  // The starts of the runs of 2 or more combining marks and of the composition segments are
+  // marked before any slots are modified so no slot is read while another thread modifies it.
+  bool const is_composing =
+    p.form == unicode_normalization_form::NFC || p.form == unicode_normalization_form::NFKC;
   if (!cps.empty()) {
     auto const reorder   = detail::reorder_fn{d_cps, d_scp};
+    auto const composer  = detail::composer{d_cps,
+                                           detail::as_span(p.comp_keys),
+                                           detail::as_span(p.comp_values),
+                                           detail::as_span(p.compat_decomp_flags)};
     auto const num_slots = static_cast<int64_t>(cps.size());
     auto const num_words =
       cudf::util::div_rounding_up_safe(num_slots, static_cast<int64_t>(cudf::detail::warp_size));
     auto run_starts = cuda::device_buffer<cudf::bitmask_type>{
       stream, temp_mr, static_cast<std::size_t>(num_words), cuda::no_init};
+    auto segment_starts = cuda::device_buffer<cudf::bitmask_type>{
+      stream, temp_mr, static_cast<std::size_t>(is_composing ? num_words : 0), cuda::no_init};
+
     auto const num_blocks = cudf::util::div_rounding_up_safe(
       num_slots, static_cast<int64_t>(detail::mark_block_size * detail::mark_items_per_thread));
-    detail::mark_run_starts_kernel<<<num_blocks, detail::mark_block_size, 0, stream.get()>>>(
-      reorder, run_starts.data());
+    detail::mark_slots_kernel<<<num_blocks, detail::mark_block_size, 0, stream.get()>>>(
+      reorder, composer, run_starts.data(), is_composing ? segment_starts.data() : nullptr);
     CUDF_CUDA_TRY(cudaGetLastError());
+
     thrust::for_each_n(policy,
                        cuda::make_counting_iterator(int64_t{0}),
                        num_words,
                        detail::sort_marked_runs_fn{reorder, run_starts.data()});
-  }
 
-  // Canonical composition (NFC/NFKC only)
-  if (p.form == unicode_normalization_form::NFC || p.form == unicode_normalization_form::NFKC) {
-    auto const row_iter = cuda::make_counting_iterator(cudf::size_type{0});
-    thrust::for_each_n(policy,
-                       row_iter,
-                       num_rows,
-                       detail::compose_fn{d_cps,
-                                          d_scp,
-                                          detail::as_span(p.comp_keys),
-                                          detail::as_span(p.comp_values),
-                                          detail::as_span(p.compat_decomp_flags)});
+    if (is_composing) {
+      thrust::for_each_n(policy,
+                         cuda::make_counting_iterator(cudf::size_type{0}),
+                         num_rows,
+                         detail::mark_row_starts_fn{str_cp_offsets.data(), segment_starts.data()});
+      thrust::for_each_n(policy,
+                         cuda::make_counting_iterator(int64_t{0}),
+                         num_slots,
+                         detail::compose_segments_fn{composer, segment_starts.data()});
+    }
   }
 
   // Output: the UTF-8 width of each slot is summed per row for the output offsets
