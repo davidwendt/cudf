@@ -413,17 +413,17 @@ unicode_normalizer::unicode_normalizer(cudf::table_view const& unicode_data,
 
   // Compact keys and values together in one pass: remove any (key, value) pair
   // where the key is 0 (rows that build_comp_table_fn left empty).
-  // Compact keys and values together in one pass: remove any (key, value) pair
-  // where the key is 0 (rows that build_comp_table_fn left empty).
   auto kv_begin        = cuda::make_zip_iterator(d_comp_keys.begin(), d_comp_values.begin());
   auto kv_end          = cuda::make_zip_iterator(d_comp_keys.end(), d_comp_values.end());
   auto const end_itr   = thrust::remove_if(policy, kv_begin, kv_end, detail::is_zero_comp_key_fn{});
-  auto const comp_size = end_itr - kv_begin;
+  auto const comp_size = static_cast<std::size_t>(end_itr - kv_begin);
 
-  // Copy into exact-size allocations so _impl retains ~12 KiB rather than the
-  // ~400 KiB num_rows capacity left over from the compaction.
-  auto comp_keys   = cudf::detail::make_device_uvector_async(d_comp_keys, stream, mr);
-  auto comp_values = cudf::detail::make_device_uvector_async(d_comp_values, stream, mr);
+  // Copy only the compacted prefix into exact-size allocations; the tail past
+  // comp_size holds unspecified leftovers from remove_if.
+  auto comp_keys = cudf::detail::make_device_uvector_async(
+    cudf::device_span<uint64_t const>(d_comp_keys.data(), comp_size), stream, mr);
+  auto comp_values = cudf::detail::make_device_uvector_async(
+    cudf::device_span<uint32_t const>(d_comp_values.data(), comp_size), stream, mr);
 
   thrust::sort_by_key(policy, comp_keys.begin(), comp_keys.end(), comp_values.begin());
 
