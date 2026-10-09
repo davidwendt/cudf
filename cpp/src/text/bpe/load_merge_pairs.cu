@@ -6,6 +6,7 @@
 #include "text/bpe/byte_pair_encoding.cuh"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/detail/algorithms/reduce.cuh>
 #include <cudf/detail/iterator.cuh>
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
@@ -20,6 +21,7 @@
 #include <rmm/mr/polymorphic_allocator.hpp>
 
 #include <cuda/functional>
+#include <cuda/iterator>
 #include <cuda/stream>
 
 #include <fstream>
@@ -37,6 +39,8 @@ namespace {
  *
  * In the very unlikely event two pairs produce the same fingerprint,
  * the map is rebuilt using a different salt.
+ *
+ * @throw std::invalid_argument if the merge pairs contain duplicates
  *
  * @return The map and the salt used to create the fingerprints
  */
@@ -78,11 +82,34 @@ std::pair<std::unique_ptr<detail::merge_pairs_map_type>, uint64_t> initialize_me
         }));
 
     auto const inserted = merge_pairs_map->insert(iter, iter + elements, stream.get());
-    // fewer entries means a fingerprint collision (or duplicate pairs in the table)
-    if (inserted == static_cast<std::size_t>(elements)) { break; }
+    if (inserted == static_cast<std::size_t>(elements)) {
+      return {std::move(merge_pairs_map), salt};
+    }
+
+    // fewer entries means the table has duplicate pairs or two pairs produced the
+    // same fingerprint; a duplicate finds a different pair with the same strings
+    auto const map_ref      = merge_pairs_map->ref(cuco::op::find);
+    auto const is_duplicate = cuda::transform_iterator(
+      cuda::counting_iterator<cudf::size_type>{0},
+      cuda::proclaim_return_type<cudf::size_type>(
+        [input, map_ref, iter] __device__(cudf::size_type idx) -> cudf::size_type {
+          auto const found = map_ref.find(iter[idx].first);
+          if (found == map_ref.end() || found->second == idx) { return 0; }
+          auto const other = found->second;
+          return input.element<cudf::string_view>(idx * 2) ==
+                   input.element<cudf::string_view>(other * 2) &&
+                 input.element<cudf::string_view>(idx * 2 + 1) ==
+                   input.element<cudf::string_view>(other * 2 + 1);
+        }));
+    auto const duplicates = cudf::detail::reduce(is_duplicate,
+                                                 is_duplicate + elements,
+                                                 cudf::size_type{0},
+                                                 cuda::std::plus<cudf::size_type>{},
+                                                 stream);
+    CUDF_EXPECTS(duplicates == 0, "Merge pairs must be unique", std::invalid_argument);
   }
 
-  return {std::move(merge_pairs_map), salt};
+  CUDF_FAIL("Unable to create unique merge pair fingerprints");
 }
 
 /**

@@ -139,6 +139,12 @@ TEST_F(TextBytePairEncoding, BPE_Error)
   EXPECT_THROW(nvtext::load_merge_pairs(cudf::strings_column_view(*empty)), cudf::logic_error);
   auto null_pairs = cudf::test::strings_column_wrapper({"", ""}, {true, false});
   EXPECT_THROW(nvtext::load_merge_pairs(cudf::strings_column_view(null_pairs)), cudf::logic_error);
+  auto duplicates = cudf::test::strings_column_wrapper({"a b", "c d", "ab c", "c d", "e f"});
+  EXPECT_THROW(nvtext::load_merge_pairs(cudf::strings_column_view(duplicates)),
+               std::invalid_argument);
+  // same strings split differently are not duplicates
+  auto not_duplicates = cudf::test::strings_column_wrapper({"a bc", "ab c", "abc d"});
+  EXPECT_NO_THROW(nvtext::load_merge_pairs(cudf::strings_column_view(not_duplicates)));
 }
 
 // ---------------------------------------------------------------------------------------------
