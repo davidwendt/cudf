@@ -144,14 +144,17 @@ static void bench_byte_pair_encoding(nvbench::state& state)
   auto const chars_size = input.chars_size(stream);
   state.add_element_count(chars_size, "chars");
   state.add_global_memory_reads<nvbench::int8_t>(chars_size);
+  {
+    // the output size must be registered before exec() computes the summaries
+    auto result = nvtext::byte_pair_encoding(input, *merge_pairs);
+    state.add_global_memory_writes<nvbench::int8_t>(
+      cudf::strings_column_view(result->view()).chars_size(stream));
+  }
 
   auto const mem_stats_logger = cudf::memory_stats_logger();
-  std::size_t output_size     = 0;
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = nvtext::byte_pair_encoding(input, *merge_pairs);
-    output_size = cudf::strings_column_view(result->view()).chars_size(stream);
   });
-  state.add_global_memory_writes<nvbench::int8_t>(output_size);
   state.add_buffer_size(
     mem_stats_logger.peak_memory_usage(), "peak_memory_usage", "peak_memory_usage");
 }
