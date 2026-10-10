@@ -12,6 +12,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <nvtext/byte_pair_encoding.hpp>
 
@@ -59,17 +60,26 @@ bpe_data const& get_bpe_data()
     d.texts["raw"]    = prose;
     d.texts["mapped"] = bpe::gpt2_byte_map(prose);
     d.texts["code"]   = bpe::gpt2_byte_map(code);
-    auto nospace      = prose;
-    std::erase_if(nospace, [](char c) { return c == ' ' || c == '\n'; });
-    d.texts["nospace"] = bpe::gpt2_byte_map(nospace);
+    // removing whitespace shrinks the text so more is generated to keep it unrepeated
+    auto const strip = [](std::string text) {
+      std::erase_if(text, [](char c) { return c == ' ' || c == '\n'; });
+      return bpe::gpt2_byte_map(text);
+    };
+    auto nospace = strip(prose);
+    while (nospace.size() < text_size) {
+      nospace += strip(gen.generate(text_size - nospace.size()));
+    }
+    d.texts["nospace"] = std::move(nospace);
     return d;
   }();
   return data;
 }
 
 /**
- * Builds a strings column of approximately `total_bytes` from the given text
+ * Builds a strings column of approximately `total_bytes` from the start of the given text
  * with each row being `row_width` bytes (split on UTF-8 character boundaries)
+ *
+ * The text is not repeated so it must be at least `total_bytes` long.
  */
 std::unique_ptr<cudf::column> make_text_column(std::string const& text,
                                                int64_t row_width,
@@ -78,15 +88,13 @@ std::unique_ptr<cudf::column> make_text_column(std::string const& text,
   auto const is_continuation = [](char c) {
     return (static_cast<unsigned char>(c) & 0xC0) == 0x80;
   };
-  std::string chars;
-  chars.reserve(total_bytes + 8);
-  while (static_cast<int64_t>(chars.size()) < total_bytes) {
-    auto n = std::min<std::size_t>(text.size(), total_bytes - chars.size());
-    while (n < text.size() && is_continuation(text[n])) {
-      ++n;
-    }
-    chars.append(text, 0, n);
+  CUDF_EXPECTS(static_cast<int64_t>(text.size()) >= total_bytes,
+               "benchmark text is smaller than total_bytes");
+  auto n = static_cast<std::size_t>(total_bytes);
+  while (n < text.size() && is_continuation(text[n])) {
+    ++n;
   }
+  auto const chars = text.substr(0, n);
   std::vector<int64_t> offsets{0};
   auto const size = static_cast<int64_t>(chars.size());
   for (int64_t pos = 0; pos < size;) {
