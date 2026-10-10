@@ -141,14 +141,12 @@ static void bench_byte_pair_encoding(nvbench::state& state)
 
   auto stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
-  auto const chars_size = input.chars_size(stream);
-  state.add_element_count(chars_size, "chars");
-  state.add_global_memory_reads<nvbench::int8_t>(chars_size);
+  state.add_element_count(input.chars_size(stream), "chars");
+  state.add_global_memory_reads<nvbench::int8_t>(column->alloc_size());
   {
     // the output size must be registered before exec() computes the summaries
     auto result = nvtext::byte_pair_encoding(input, *merge_pairs);
-    state.add_global_memory_writes<nvbench::int8_t>(
-      cudf::strings_column_view(result->view()).chars_size(stream));
+    state.add_global_memory_writes<nvbench::int8_t>(result->alloc_size());
   }
 
   auto const mem_stats_logger = cudf::memory_stats_logger();
