@@ -35,6 +35,7 @@
 #include <cuda/atomic>
 #include <cuda/functional>
 #include <cuda/iterator>
+#include <cuda/std/bit>
 #include <cuda/std/limits>
 #include <cuda/stream>
 #include <thrust/execution_policy.h>
@@ -182,7 +183,7 @@ struct window_bits {
     while (m == 0 && j > 0) {
       m = words[--j];
     }
-    return m ? (j << 5) + 31 - __clz(m) : -1;
+    return m ? (j << 5) + 31 - cuda::std::countl_zero(m) : -1;
   }
   /// Lowest set position greater than p or `end` if none
   __device__ int next(int p, int end) const
@@ -192,7 +193,7 @@ struct window_bits {
     while (m == 0 && j + 1 < num_words) {
       m = words[++j];
     }
-    return m ? (j << 5) + __ffs(m) - 1 : end;
+    return m ? (j << 5) + cuda::std::countr_zero(m) : end;
   }
 };
 
@@ -353,7 +354,7 @@ CUDF_KERNEL void bpe_short_fn(char const* d_input_chars,
         // merge left-to-right skipping a pair whose left token was just merged
         if (lane == 0) {
           for (auto m = C; m; m &= m - 1) {
-            auto const q = (j << 5) + __ffs(m) - 1;
+            auto const q = (j << 5) + cuda::std::countr_zero(m);
             if (!M.test(S.prev(q))) { M.words[j] |= 1u << (q & 31); }
           }
         }
