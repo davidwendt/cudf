@@ -46,10 +46,17 @@ constexpr int64_t match_slots_factor = 2;
 struct match_slots {
   cudf::detail::input_offsetalator d_offsets;
 
+  /**
+   * @brief Returns the number of slots for the given number of input bytes
+   */
+  static constexpr CUDF_HOST_DEVICE int64_t slots_for_bytes(int64_t bytes)
+  {
+    return (bytes * match_slots_factor) / static_cast<int64_t>(sizeof(match_pair));
+  }
+
   __device__ int64_t begin(size_type row) const
   {
-    return ((d_offsets[row] - d_offsets[0]) * match_slots_factor) /
-           static_cast<int64_t>(sizeof(match_pair));
+    return slots_for_bytes(d_offsets[row] - d_offsets[0]);
   }
   __device__ size_type capacity(size_type row) const
   {
@@ -221,13 +228,10 @@ std::unique_ptr<column> replace_re_fn(strings_column_view const& input,
   auto const d_column      = column_device_view::create(input.parent(), stream);
   auto const d_strings     = *d_column;
 
-  auto const chars_begin = get_offset_value(input.offsets(), input.offset(), stream);
-  auto const chars_bytes =
-    get_offset_value(input.offsets(), input.offset() + strings_count, stream) - chars_begin;
   auto const slots = match_slots{
     cudf::detail::offsetalator_factory::make_input_iterator(input.offsets(), input.offset())};
-  auto const total_slots =
-    (chars_bytes * match_slots_factor) / static_cast<int64_t>(sizeof(match_pair));
+  auto const [first_offset, last_offset] = get_first_and_last_offset(input, stream);
+  auto const total_slots                 = match_slots::slots_for_bytes(last_offset - first_offset);
 
   // compute the output sizes and record the match positions that fit
   auto counts  = cuda::device_buffer<size_type>(stream, temp_mr, strings_count, cuda::no_init);
