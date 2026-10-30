@@ -51,6 +51,9 @@ rapids-logger "Build libcudf and gtests (Debug)"
 # The GPU architecture defaults to the native GPU on this node.
 ./build.sh -g -n libcudf tests
 
+rapids-logger "Configured build settings"
+grep -E "^(CMAKE_BUILD_TYPE|CMAKE_CUDA_ARCHITECTURES|BUILD_TESTS|BUILD_BENCHMARKS):" cpp/build/CMakeCache.txt
+
 sccache --show-adv-stats
 sccache --stop-server >/dev/null 2>&1 || true
 
