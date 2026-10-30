@@ -60,3 +60,12 @@ NVBENCH_BENCH(bench_minhash)
   .add_int64_axis("hash_width", {12, 24})
   .add_int64_axis("parameters", {26, 260})
   .add_int64_axis("hash_type", {32, 64});
+
+// fewer rows with much longer strings
+NVBENCH_BENCH(bench_minhash)
+  .set_name("minhash_wide")
+  .add_int64_axis("num_rows", {16, 256})
+  .add_int64_axis("row_width", {1000000, 4000000})
+  .add_int64_axis("hash_width", {24})
+  .add_int64_axis("parameters", {26, 260})
+  .add_int64_axis("hash_type", {32, 64});
