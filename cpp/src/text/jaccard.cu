@@ -13,7 +13,6 @@
 #include <cudf/detail/utilities/grid_1d.cuh>
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/hashing/detail/murmurhash3_x86_32.cuh>
-#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -38,6 +37,7 @@
 #include <cuda/std/iterator>
 #include <cuda/std/limits>
 #include <cuda/std/span>
+#include <cuda/std/tuple>
 #include <cuda/stream>
 #include <thrust/transform.h>
 
@@ -237,6 +237,10 @@ __device__ cuda::std::span<hash_value_type const> get_row(
 
 /**
  * @brief Creates a set over the given shared-memory slots
+ *
+ * @param slots Shared-memory slots for the set; must be initialized to `empty_hash`
+ * @param num_slots Number of slots
+ * @return A set reference over the slots
  */
 __device__ set_ref_type make_set(hash_value_type* slots, int32_t num_slots)
 {
@@ -254,6 +258,10 @@ __device__ set_ref_type make_set(hash_value_type* slots, int32_t num_slots)
  * the set slot is computed from the low bits.
  * Scaling the hash by the number of partitions and keeping only the high bits
  * maps the hash range evenly onto `[0, partitions)`.
+ *
+ * @param hash Hash value to partition
+ * @param partitions Number of partitions
+ * @return Partition index in `[0, partitions)`
  */
 __device__ uint32_t partition_of(hash_value_type hash, uint64_t partitions)
 {
@@ -270,6 +278,14 @@ __device__ uint32_t partition_of(hash_value_type hash, uint64_t partitions)
  * Only values for which `filter(value)==true` are processed.
  * The group must be synchronized before calling this function so the sets are initialized.
  *
+ * @tparam Group Cooperative group type processing the hashes
+ * @tparam Filter Predicate type for selecting the hashes to process
+ * @param group Cooperative group processing the hashes
+ * @param hashes1 Values to insert into set1
+ * @param hashes2 Values to insert into set2
+ * @param set1 Set for the first values
+ * @param set2 Set for the second values
+ * @param filter Selects the values to process
  * @return The unique counts of set1 and set2 and the intersection count for this thread
  */
 template <typename Group, typename Filter>
