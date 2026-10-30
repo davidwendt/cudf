@@ -39,9 +39,11 @@ static void bench_minhash(nvbench::state& state)
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().get()));
 
-  auto chars_size = input.chars_size(cudf::get_default_stream());
-  state.add_global_memory_reads<nvbench::int8_t>(chars_size);
-  state.add_global_memory_writes<nvbench::int32_t>(num_rows);  // output are hashes
+  state.add_global_memory_reads<nvbench::int8_t>(strings_table->alloc_size());
+  // output is a hash value per parameter for each row
+  auto const hash_size = base64 ? sizeof(uint64_t) : sizeof(uint32_t);
+  state.add_global_memory_writes<nvbench::int8_t>(static_cast<std::size_t>(num_rows) * parameters *
+                                                  hash_size);
 
   auto const mem_stats_logger = cudf::memory_stats_logger();
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
