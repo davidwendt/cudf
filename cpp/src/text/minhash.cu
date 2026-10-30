@@ -156,6 +156,10 @@ struct staged_string {
  * This is equivalent to `cudf::strings::detail::bytes_to_character_position`
  * for valid UTF-8 but processes 4 bytes at a time.
  *
+ * Valid UTF-8 requires at most `4 * width` bytes for `width` characters plus one word
+ * to locate the next character. The scan is limited to this so that invalid UTF-8
+ * (e.g. long runs of continuation bytes) cannot read beyond the staged bytes.
+ *
  * @return Number of bytes and the number of characters not found before the end of the string
  */
 template <typename Accessor>
@@ -163,8 +167,12 @@ __device__ inline cuda::std::pair<cudf::size_type, cudf::size_type> bytes_for_wi
   Accessor const& str, cudf::size_type pos, cudf::size_type width)
 {
   cudf::size_type count = 0;
+  auto const remaining  = str.size - pos;
+  // the scan stops when the bytes left reach this value
+  auto const stop = static_cast<cudf::size_type>(
+    cuda::std::max(int64_t{0}, remaining - 4 * static_cast<int64_t>(width) - 4));
   // iterating on the remaining bytes (rather than the position) avoids overflow near the max size
-  for (auto left = str.size - pos; left > 0; left -= 4) {
+  for (auto left = remaining; left > stop; left -= 4) {
     auto const itr = str.size - left;
     auto const w   = str(itr);
     // high bit of each byte is set if the byte is not a UTF-8 continuation byte
@@ -180,7 +188,7 @@ __device__ inline cuda::std::pair<cudf::size_type, cudf::size_type> bytes_for_wi
     }
     count += n;
   }
-  return {str.size - pos, width - count};
+  return {remaining - stop, width - count};
 }
 
 /**
