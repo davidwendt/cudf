@@ -12,8 +12,8 @@
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/offsets_iterator_factory.cuh>
 #include <cudf/detail/sequence.hpp>
+#include <cudf/detail/sizes_to_offsets_iterator.cuh>
 #include <cudf/detail/utilities/cuda.cuh>
-#include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/detail/utilities/grid_1d.cuh>
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/hashing/detail/hashing.hpp>
@@ -21,6 +21,7 @@
 #include <cudf/hashing/detail/murmurhash3_x86_32.cuh>
 #include <cudf/lists/list_device_view.cuh>
 #include <cudf/lists/lists_column_device_view.cuh>
+#include <cudf/strings/detail/utf8.hpp>
 #include <cudf/strings/string_view.cuh>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
@@ -40,11 +41,12 @@
 #include <cuda/std/iterator>
 #include <cuda/std/limits>
 #include <cuda/std/tuple>
+#include <cuda/std/type_traits>
+#include <cuda/std/utility>
 #include <cuda/stream>
 #include <thrust/binary_search.h>
 #include <thrust/execution_policy.h>
 #include <thrust/fill.h>
-#include <thrust/scan.h>
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
 #include <thrust/transform.h>
@@ -66,9 +68,10 @@ constexpr cuda::std::size_t params_per_thread = sizeof(hash_value_type) == 4 ? 3
 template <typename hash_value_type>
 constexpr bool prefetch_hash = sizeof(hash_value_type) == 8;
 
-// Separate kernels are used to process strings above and below this value (in bytes).
+// Separate kernels are used by minhash_ngrams to process rows above and below
+// this value (in number of list elements).
 constexpr cudf::size_type wide_row_threshold = 1 << 18;  // 256K
-// The number of blocks per string for the above-threshold kernel processing.
+// The number of blocks per row for the above-threshold kernel processing.
 constexpr cudf::size_type blocks_per_row = 64;
 // The above values were determined using the redpajama and books_sample datasets
 
@@ -249,7 +252,7 @@ CUDF_KERNEL void minhash_ngrams_kernel(cudf::lists_column_device_view const d_in
       cuda::std::distance(first_str.data(), last_str.data()) + last_str.size_bytes());
     auto const hash_str = cudf::string_view(first_str.data(), size);
     hash_value_type hv;
-    if constexpr (std::is_same_v<hash_value_type, uint32_t>) {
+    if constexpr (cuda::std::is_same_v<hash_value_type, uint32_t>) {
       hv = hasher(hash_str);
     } else {
       hv = cuda::std::get<0>(hasher(hash_str));
@@ -464,7 +467,7 @@ __device__ inline hash_value_type hash_substring(Accessor const& str,
   auto const hasher = HashFunction(seed);
   auto const sv     = cudf::string_view(str.data(pos, bytes), bytes);
   hash_value_type hv;
-  if constexpr (std::is_same_v<hash_value_type, uint32_t>) {
+  if constexpr (cuda::std::is_same_v<hash_value_type, uint32_t>) {
     hv = hasher(sv);
   } else {
     hv = cuda::std::get<0>(hasher(sv));
@@ -483,6 +486,19 @@ CUDF_HOST_DEVICE constexpr cudf::size_type max_param_groups(cudf::size_type para
   constexpr auto ppt = fused_params_per_thread<hash_value_type>;
   return cuda::std::min(cudf::util::div_rounding_up_safe(param_count, ppt),
                         static_cast<cudf::size_type>(block_size));
+}
+
+/**
+ * @brief Returns the dynamic shared memory size in bytes used by minhash_fused_kernel
+ *
+ * @param max_groups Maximum number of parameter groups (see max_param_groups)
+ * @param halo Number of bytes staged beyond each tile (see halo_size)
+ */
+template <typename hash_value_type>
+constexpr std::size_t fused_shmem_size(cudf::size_type max_groups, cudf::size_type halo)
+{
+  auto const hash_count = seed_tile_bytes + max_groups * fused_params_per_thread<hash_value_type>;
+  return static_cast<std::size_t>(hash_count) * sizeof(hash_value_type) + seed_tile_bytes + halo;
 }
 
 /**
@@ -578,8 +594,12 @@ CUDF_KERNEL void __launch_bounds__(block_size, fused_min_blocks<hash_value_type>
   auto const staged_bytes = reinterpret_cast<char*>(staged_words);
   auto const stage_size   = seed_tile_bytes + halo_size(width);
 
-  for (cudf::size_type chunk = 0; chunk < param_count; chunk += max_groups * ppt) {
-    auto const chunk_count = cuda::std::min(param_count - chunk, max_groups * ppt);
+  // iterating on the chunk index (rather than the position) avoids overflow
+  auto const chunk_size = max_groups * ppt;
+  auto const num_chunks = cudf::util::div_rounding_up_safe(param_count, chunk_size);
+  for (cudf::size_type chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+    auto const chunk       = chunk_idx * chunk_size;
+    auto const chunk_count = cuda::std::min(param_count - chunk, chunk_size);
     // each thread is assigned a group of parameters and a hash lane;
     // all the threads in a hash lane read the same hash values
     auto const groups    = cudf::util::div_rounding_up_safe(chunk_count, ppt);
@@ -614,8 +634,8 @@ CUDF_KERNEL void __launch_bounds__(block_size, fused_min_blocks<hash_value_type>
       // compute the hashes for this tile
       auto const str =
         staged_string<fully_staged>{staged_words, stage_size, d_str, tile, size_bytes};
-      auto const tile_size = cuda::std::min(cudf::size_type{seed_tile_bytes}, end - tile);
-      for (auto i = lane_idx; i < tile_size; i += block_size) {
+      auto const tile_count = cuda::std::min(cudf::size_type{seed_tile_bytes}, end - tile);
+      for (auto i = lane_idx; i < tile_count; i += block_size) {
         hash_tile[i] = cudf::strings::detail::is_utf8_continuation_char(staged_bytes[i])
                          ? hash_value_type{0}
                          : hash_substring<HashFunction>(str, tile + i, width, seed);
@@ -624,7 +644,7 @@ CUDF_KERNEL void __launch_bounds__(block_size, fused_min_blocks<hash_value_type>
 
       // each thread accumulates the min values for its parameters
       if (hash_lane < lanes) {
-        for (auto i = hash_lane; i < tile_size; i += lanes) {
+        for (auto i = hash_lane; i < tile_count; i += lanes) {
           auto const hv = hash_tile[i];
           // 0 is used as a skip sentinel for UTF-8 and trailing bytes
           if (hv == 0) { continue; }
@@ -752,33 +772,26 @@ std::unique_ptr<cudf::column> minhash_fn(cudf::strings_column_view const& input,
                               mr.get_output_mr());
   auto d_results = results->mutable_view().data<hash_value_type>();
 
-  // compute the number of blocks (sections) for each row
+  // compute the first block (section) for each row
   auto const num_rows = input.size();
-  // each row requires at most (size_bytes / section_bytes) + 1 blocks
-  CUDF_EXPECTS(static_cast<int64_t>(num_rows) + (input.chars_size(stream) / section_bytes) <
-                 static_cast<int64_t>(std::numeric_limits<cudf::size_type>::max()),
-               "The input is too large for the minhash kernel",
-               std::overflow_error);
   auto block_offsets =
     cuda::device_buffer<cudf::size_type>(stream, temp_mr, num_rows + 1, cuda::no_init);
-  auto sections_fn = [d_strings = *d_strings, num_rows] __device__(auto idx) -> cudf::size_type {
-    if (idx == num_rows) { return 0; }
-    auto const size =
-      d_strings.is_null(idx) ? 0 : d_strings.element<cudf::string_view>(idx).size_bytes();
-    return cuda::std::max(cudf::util::div_rounding_up_safe(size, section_bytes), 1);
-  };
-  auto const policy = rmm::exec_policy_nosync(stream, temp_mr);
-  thrust::transform(policy,
-                    cuda::counting_iterator<cudf::size_type>{0},
-                    cuda::counting_iterator<cudf::size_type>{num_rows + 1},
-                    block_offsets.begin(),
-                    sections_fn);
-  thrust::exclusive_scan(policy, block_offsets.begin(), block_offsets.end(), block_offsets.begin());
-  cudf::size_type num_blocks = 0;
-  cudf::detail::cuda_memcpy(
-    cudf::host_span<cudf::size_type>(&num_blocks, 1),
-    cudf::device_span<cudf::size_type const>(block_offsets.data() + num_rows, 1),
-    stream);
+  auto sections_fn = cuda::proclaim_return_type<cudf::size_type>(
+    [d_strings = *d_strings, num_rows] __device__(cudf::size_type idx) {
+      // the value for the last element (idx == num_rows) is ignored by the exclusive scan
+      if (idx == num_rows || d_strings.is_null(idx)) { return 1; }
+      auto const size = d_strings.element<cudf::string_view>(idx).size_bytes();
+      return cuda::std::max(cudf::util::div_rounding_up_safe(size, section_bytes), 1);
+    });
+  auto const sections_itr =
+    cuda::transform_iterator(cuda::counting_iterator<cudf::size_type>{0}, sections_fn);
+  auto const total_blocks = cudf::detail::sizes_to_offsets(
+    sections_itr, sections_itr + num_rows + 1, block_offsets.begin(), 0, stream, mr);
+  CUDF_EXPECTS(total_blocks < static_cast<int64_t>(std::numeric_limits<cudf::size_type>::max()),
+               "The input is too large for the minhash kernel",
+               std::overflow_error);
+  auto const num_blocks = static_cast<cudf::size_type>(total_blocks);
+  auto const policy     = rmm::exec_policy_nosync(stream, temp_mr);
 
   // rows processed by multiple blocks use atomic-min and so require initializing to max
   if (num_blocks > num_rows) {
@@ -792,10 +805,10 @@ std::unique_ptr<cudf::column> minhash_fn(cudf::strings_column_view const& input,
   // fallback in staged_string is not needed
   auto const fully_staged = width <= (max_halo_bytes - 16) / 4;
   auto const param_count  = static_cast<cudf::size_type>(parameter_a.size());
-  auto const shmem_size   = static_cast<std::size_t>(
-    (seed_tile_bytes + max_param_groups<hash_value_type>(param_count) *
-                         fused_params_per_thread<hash_value_type>)*sizeof(hash_value_type) +
-    seed_tile_bytes + halo_size(width));
+  auto const shmem_size   = fused_shmem_size<hash_value_type>(
+    max_param_groups<hash_value_type>(param_count), halo_size(width));
+  static_assert(fused_shmem_size<hash_value_type>(block_size, max_halo_bytes) <= 48 * 1024,
+                "minhash_fused_kernel shared memory exceeds the default 48KB limit");
   auto fused_kernel = fully_staged ? minhash_fused_kernel<HashFunction, hash_value_type, true>
                                    : minhash_fused_kernel<HashFunction, hash_value_type, false>;
   fused_kernel<<<num_blocks, block_size, shmem_size, stream.get()>>>(
