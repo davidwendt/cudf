@@ -97,7 +97,7 @@ constexpr cudf::size_type max_halo_bytes = 4096;
  * Each character is at most 4 bytes and the 4-byte reads used for counting characters
  * may extend a few bytes beyond the last byte. The result is capped at max_halo_bytes.
  */
-__host__ __device__ constexpr cudf::size_type halo_size(cudf::size_type width)
+CUDF_HOST_DEVICE constexpr cudf::size_type halo_size(cudf::size_type width)
 {
   return width <= (max_halo_bytes - 16) / 4 ? 4 * width + 16 : max_halo_bytes;
 }
@@ -478,7 +478,7 @@ __device__ inline hash_value_type hash_substring(Accessor const& str,
  * Each group is fused_params_per_thread parameters.
  */
 template <typename hash_value_type>
-__host__ __device__ constexpr cudf::size_type max_param_groups(cudf::size_type param_count)
+CUDF_HOST_DEVICE constexpr cudf::size_type max_param_groups(cudf::size_type param_count)
 {
   constexpr auto ppt = fused_params_per_thread<hash_value_type>;
   return cuda::std::min(cudf::util::div_rounding_up_safe(param_count, ppt),
