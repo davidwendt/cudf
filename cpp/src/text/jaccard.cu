@@ -187,30 +187,30 @@ CUDF_KERNEL void substring_hash_kernel(cudf::column_device_view const d_strings,
  * @param d_strings Input strings column to hash
  * @param width Substring width in characters
  * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Memory resources used for temporary allocations and the returned buffers
  * @return The hash values and offsets to each row
  */
 std::pair<cuda::device_buffer<hash_value_type>, cuda::device_buffer<int64_t>> hash_substrings(
-  cudf::column_device_view const& d_strings, cudf::size_type width, cuda::stream_ref stream)
+  cudf::column_device_view const& d_strings,
+  cudf::size_type width,
+  cuda::stream_ref stream,
+  cudf::memory_resources mr)
 {
+  auto const output_mr = mr.get_output_mr();
+
   // count substrings
-  auto offsets          = cuda::device_buffer<int64_t>(stream,
-                                              cudf::get_current_device_resource_ref(),
-                                              static_cast<std::size_t>(d_strings.size()) + 1,
-                                              cuda::no_init);
+  auto offsets = cuda::device_buffer<int64_t>(
+    stream, output_mr, static_cast<std::size_t>(d_strings.size()) + 1, cuda::no_init);
   auto const num_blocks = cudf::util::div_rounding_up_safe(
     static_cast<cudf::thread_index_type>(d_strings.size()) * cudf::detail::warp_size, block_size);
   count_substrings_kernel<<<num_blocks, block_size, 0, stream.get()>>>(d_strings, width, offsets);
   CUDF_CUDA_TRY(cudaGetLastError());
-  auto const total_hashes = cudf::detail::sizes_to_offsets(offsets.begin(),
-                                                           offsets.end(),
-                                                           offsets.begin(),
-                                                           0,
-                                                           stream,
-                                                           cudf::get_current_device_resource_ref());
+  auto const total_hashes = cudf::detail::sizes_to_offsets(
+    offsets.begin(), offsets.end(), offsets.begin(), 0, stream, mr.as_temporary());
 
   // hash substrings
-  auto hashes = cuda::device_buffer<hash_value_type>(
-    stream, cudf::get_current_device_resource_ref(), total_hashes, cuda::no_init);
+  auto hashes =
+    cuda::device_buffer<hash_value_type>(stream, output_mr, total_hashes, cuda::no_init);
   substring_hash_kernel<<<num_blocks, block_size, 0, stream.get()>>>(
     d_strings, width, offsets, hashes);
   CUDF_CUDA_TRY(cudaGetLastError());
@@ -568,6 +568,7 @@ CUDF_KERNEL void count_partitions_kernel(cuda::std::span<hash_value_type const> 
  * @param d_counts2 Output unique counts for the second column
  * @param d_intersects Output intersect counts
  * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Memory resources used for temporary allocations
  */
 void count_partitions(cuda::std::span<hash_value_type const> hashes1,
                       cuda::std::span<int64_t const> offsets1,
@@ -576,16 +577,17 @@ void count_partitions(cuda::std::span<hash_value_type const> hashes1,
                       cuda::std::span<cudf::size_type> d_counts1,
                       cuda::std::span<cudf::size_type> d_counts2,
                       cuda::std::span<cudf::size_type> d_intersects,
-                      cuda::stream_ref stream)
+                      cuda::stream_ref stream,
+                      cudf::memory_resources mr)
 {
-  auto const rows = static_cast<cudf::size_type>(d_counts1.size());
-  auto const mr   = cudf::get_current_device_resource_ref();
+  auto const rows    = static_cast<cudf::size_type>(d_counts1.size());
+  auto const temp_mr = mr.get_temporary_mr();
 
   // compute the number of partitions for each row: rows handled by count_rows_kernel get 0
-  auto work_offsets =
-    cuda::device_buffer<int64_t>(stream, mr, static_cast<std::size_t>(rows) + 1, cuda::no_init);
+  auto work_offsets = cuda::device_buffer<int64_t>(
+    stream, temp_mr, static_cast<std::size_t>(rows) + 1, cuda::no_init);
   thrust::transform(
-    rmm::exec_policy_nosync(stream, mr),
+    rmm::exec_policy_nosync(stream, temp_mr),
     cuda::counting_iterator<cudf::size_type>{0},
     cuda::counting_iterator<cudf::size_type>{rows},
     work_offsets.begin(),
@@ -597,14 +599,16 @@ void count_partitions(cuda::std::span<hash_value_type const> hashes1,
                             int64_t{max_partitions});
     });
   auto const total_work = cudf::detail::sizes_to_offsets(
-    work_offsets.begin(), work_offsets.end(), work_offsets.begin(), 0, stream, mr);
+    work_offsets.begin(), work_offsets.end(), work_offsets.begin(), 0, stream, mr.as_temporary());
   if (total_work == 0) { return; }
 
   // scatter the hashes of each row into their partitions
-  auto parted1  = cuda::device_buffer<hash_value_type>(stream, mr, hashes1.size(), cuda::no_init);
-  auto parted2  = cuda::device_buffer<hash_value_type>(stream, mr, hashes2.size(), cuda::no_init);
-  auto buckets1 = cuda::device_buffer<int64_t>(stream, mr, total_work, cuda::no_init);
-  auto buckets2 = cuda::device_buffer<int64_t>(stream, mr, total_work, cuda::no_init);
+  auto parted1 =
+    cuda::device_buffer<hash_value_type>(stream, temp_mr, hashes1.size(), cuda::no_init);
+  auto parted2 =
+    cuda::device_buffer<hash_value_type>(stream, temp_mr, hashes2.size(), cuda::no_init);
+  auto buckets1 = cuda::device_buffer<int64_t>(stream, temp_mr, total_work, cuda::no_init);
+  auto buckets2 = cuda::device_buffer<int64_t>(stream, temp_mr, total_work, cuda::no_init);
   partition_hashes_kernel<<<rows, block_size, 0, stream.get()>>>(
     hashes1, offsets1, work_offsets, parted1, buckets1);
   CUDF_CUDA_TRY(cudaGetLastError());
@@ -661,7 +665,7 @@ std::unique_ptr<cudf::column> jaccard_index(cudf::strings_column_view const& inp
                                             cudf::strings_column_view const& input2,
                                             cudf::size_type width,
                                             cuda::stream_ref stream,
-                                            rmm::device_async_resource_ref mr)
+                                            cudf::memory_resources mr)
 {
   CUDF_EXPECTS(
     input1.size() == input2.size(), "input columns must be the same size", std::invalid_argument);
@@ -672,11 +676,12 @@ std::unique_ptr<cudf::column> jaccard_index(cudf::strings_column_view const& inp
   constexpr auto output_type = cudf::data_type{cudf::type_id::FLOAT32};
   if (input1.is_empty()) { return cudf::make_empty_column(output_type); }
 
-  auto const rows = input1.size();
+  auto const rows           = input1.size();
+  auto const temp_mr        = mr.get_temporary_mr();
+  auto const temp_resources = mr.as_temporary();
 
   // unique counts for each column and the intersect counts
-  auto counts = cuda::make_buffer(
-    stream, cudf::get_current_device_resource_ref(), 3L * rows, cudf::size_type{0});
+  auto counts             = cuda::make_buffer(stream, temp_mr, 3L * rows, cudf::size_type{0});
   auto const d_counts     = cuda::std::span<cudf::size_type>(counts);
   auto const d_counts1    = d_counts.subspan(0, rows);
   auto const d_counts2    = d_counts.subspan(rows, rows);
@@ -684,10 +689,10 @@ std::unique_ptr<cudf::column> jaccard_index(cudf::strings_column_view const& inp
 
   {
     // build hashes of the substrings
-    auto const d_strings1        = cudf::column_device_view::create(input1.parent(), stream);
-    auto const d_strings2        = cudf::column_device_view::create(input2.parent(), stream);
-    auto const [hash1, offsets1] = hash_substrings(*d_strings1, width, stream);
-    auto const [hash2, offsets2] = hash_substrings(*d_strings2, width, stream);
+    auto const d_strings1 = cudf::column_device_view::create(input1.parent(), stream, temp_mr);
+    auto const d_strings2 = cudf::column_device_view::create(input2.parent(), stream, temp_mr);
+    auto const [hash1, offsets1] = hash_substrings(*d_strings1, width, stream, temp_resources);
+    auto const [hash2, offsets2] = hash_substrings(*d_strings2, width, stream, temp_resources);
 
     // count rows small enough to be processed by a single warp
     auto const num_blocks = cudf::util::div_rounding_up_safe(
@@ -697,15 +702,16 @@ std::unique_ptr<cudf::column> jaccard_index(cudf::strings_column_view const& inp
     CUDF_CUDA_TRY(cudaGetLastError());
 
     // count the remaining rows by partitioning their values
-    count_partitions(hash1, offsets1, hash2, offsets2, d_counts1, d_counts2, d_intersects, stream);
+    count_partitions(
+      hash1, offsets1, hash2, offsets2, d_counts1, d_counts2, d_intersects, stream, temp_resources);
   }
 
-  auto results =
-    cudf::make_numeric_column(output_type, rows, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto results = cudf::make_numeric_column(
+    output_type, rows, cudf::mask_state::UNALLOCATED, stream, mr.get_output_mr());
   auto d_results = results->mutable_view().data<float>();
 
   // compute the jaccard using the unique counts and the intersect counts
-  thrust::transform(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+  thrust::transform(rmm::exec_policy_nosync(stream, temp_mr),
                     cuda::counting_iterator<cudf::size_type>{0},
                     cuda::counting_iterator<cudf::size_type>{rows},
                     d_results,
@@ -726,7 +732,7 @@ std::unique_ptr<cudf::column> jaccard_index(cudf::strings_column_view const& inp
                                             cudf::strings_column_view const& input2,
                                             cudf::size_type width,
                                             cuda::stream_ref stream,
-                                            rmm::device_async_resource_ref mr)
+                                            cudf::memory_resources mr)
 {
   CUDF_FUNC_RANGE();
   return detail::jaccard_index(input1, input2, width, stream, mr);
