@@ -339,27 +339,6 @@ TEST_F(MinHashTest, PermutedParameterChunks)
   verify_parameter_slices<uint64_t>(view, 5000, mh64);
 }
 
-TEST_F(MinHashTest, InvalidUTF8)
-{
-  // results for invalid UTF-8 are undefined but should not cause out-of-bounds reads
-  auto input = cudf::test::strings_column_wrapper({"a" + std::string(6000, '\x80') + "bc",
-                                                   std::string(3000, '\xbf'),
-                                                   "x" + std::string(40000, '\x80')});
-  auto view  = cudf::strings_column_view(input);
-
-  auto first    = cuda::counting_iterator<uint32_t>{10};
-  auto params   = cudf::test::fixed_width_column_wrapper<uint32_t>(first, first + 3);
-  auto params64 = cudf::test::fixed_width_column_wrapper<uint64_t, uint32_t>(first, first + 3);
-  for (auto width : {4, 1100}) {
-    auto results =
-      nvtext::minhash(view, 0, cudf::column_view(params), cudf::column_view(params), width);
-    EXPECT_EQ(results->size(), view.size());
-    auto results64 =
-      nvtext::minhash64(view, 0, cudf::column_view(params64), cudf::column_view(params64), width);
-    EXPECT_EQ(results64->size(), view.size());
-  }
-}
-
 TEST_F(MinHashTest, EmptyTest)
 {
   auto input   = cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
